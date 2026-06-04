@@ -11,15 +11,6 @@ import pandas as pd
 import streamlit as st
 from wordcloud import WordCloud
 
-# Optional imports for deep learning model.
-# The app will still run for ML mode even if TensorFlow is not installed,
-# as long as DL mode is not selected.
-try:
-    import tensorflow as tf
-    from tensorflow.keras.preprocessing.sequence import pad_sequences
-except Exception:  # pragma: no cover
-    tf = None
-    pad_sequences = None
 
 
 APP_TITLE = "Peer Feedback Multi-label Classification"

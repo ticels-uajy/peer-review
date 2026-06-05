@@ -320,16 +320,8 @@ def _ensure_compatible_dl_runtime(model_path: str) -> None:
 
 
 def _load_keras_model_robust(model_path: str):
+    """Load a Keras model with fallbacks for Keras 3 / tf.keras differences."""
     _ensure_compatible_dl_runtime(model_path)
-    """Load a Keras model with fallbacks for Keras 3 / tf.keras differences.
-
-    The user's DL model may have been saved with standalone Keras 3, where the
-    serialized config can reference modules such as `keras.src.models.functional`.
-    Loading that artifact with an older or mismatched tf.keras can fail.
-    Therefore, prefer standalone Keras when it is available, then fall back to
-    tf.keras, and always try compile=False first because this app only needs
-    inference.
-    """
     loaders = []
     if standalone_keras is not None:
         loaders.append(("keras.models.load_model", standalone_keras.models.load_model))

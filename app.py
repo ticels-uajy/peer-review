@@ -33,7 +33,8 @@ from sklearn.metrics import classification_report, multilabel_confusion_matrix
 from sklearn.preprocessing import LabelEncoder
 from wordcloud import WordCloud
 
-# TensorFlow is imported lazily only when DL is used.
+# Keras/TensorFlow is imported lazily only when DL is used.
+# DL models saved with Keras 3 must be loaded with standalone keras, not older tf.keras.
 
 
 # -----------------------------------------------------------------------------
@@ -199,17 +200,67 @@ def load_ml_artifact(artifact_dir: str) -> Tuple[object, Dict, List[str], np.nda
     return model, metadata, labels, thresholds
 
 
+def load_keras_model_compat(model_path: Path):
+    """Load a .keras model saved by either Keras 3 or tf.keras.
+
+    The training notebook may save models with Keras 3, whose serialized config
+    contains modules such as `keras.src.models.functional`. Such models cannot be
+    deserialized by older `tf.keras` / `keras<3`. This loader therefore tries
+    standalone Keras first, then falls back to TensorFlow Keras.
+    """
+    errors = []
+
+    try:
+        import keras  # Keras 3 standalone package
+
+        return keras.saving.load_model(model_path, compile=False, safe_mode=False)
+    except Exception as exc:  # pragma: no cover - shown to the Streamlit user
+        errors.append(f"keras.saving.load_model failed: {exc}")
+
+    try:
+        from tensorflow import keras as tf_keras
+
+        return tf_keras.models.load_model(model_path, compile=False)
+    except Exception as exc:  # pragma: no cover - shown to the Streamlit user
+        errors.append(f"tf.keras.models.load_model failed: {exc}")
+
+    raise RuntimeError(
+        "Model DL tidak dapat dimuat. Kemungkinan besar versi Keras/TensorFlow "
+        "di environment Streamlit tidak sama dengan versi saat model disimpan. "
+        "Gunakan requirements terbaru: keras>=3 dan tensorflow>=2.16. Detail: "
+        + " | ".join(errors)
+    )
+
+
+def pad_sequences_compat(sequences, max_len: int):
+    """Pad token sequences with Keras 3 first, then tf.keras fallback."""
+    try:
+        import keras
+
+        return keras.utils.pad_sequences(sequences, maxlen=max_len, padding="post", truncating="post")
+    except Exception:
+        from tensorflow.keras.preprocessing.sequence import pad_sequences
+
+        return pad_sequences(sequences, maxlen=max_len, padding="post", truncating="post")
+
+
 @st.cache_resource(show_spinner=False)
 def load_dl_artifact(artifact_dir: str):
-    from tensorflow.keras.models import load_model
-
     artifact_path = Path(artifact_dir)
-    model = load_model(artifact_path / "best_dl_model.keras")
-    tokenizer = joblib.load(artifact_path / "best_dl_tokenizer.joblib")
-    metadata = read_json(artifact_path / "best_dl_model_metadata.json")
+    model_path = artifact_path / "best_dl_model.keras"
+    tokenizer_path = artifact_path / "best_dl_tokenizer.joblib"
+    metadata_path = artifact_path / "best_dl_model_metadata.json"
+
+    missing = [str(p.name) for p in [model_path, tokenizer_path] if not p.exists()]
+    if missing:
+        raise FileNotFoundError(f"Artefak DL tidak ditemukan: {', '.join(missing)} di {artifact_path}")
+
+    model = load_keras_model_compat(model_path)
+    tokenizer = joblib.load(tokenizer_path)
+    metadata = read_json(metadata_path)
     labels = metadata.get("labels") or DEFAULT_LABELS
     thresholds = thresholds_from_metadata(metadata, labels)
-    max_len = int(metadata.get("dl_max_len", metadata.get("max_len", 120)))
+    max_len = int(metadata.get("dl_max_len", metadata.get("max_len", 200)))
     return model, tokenizer, metadata, labels, thresholds, max_len
 
 
@@ -226,12 +277,10 @@ def predict_ml(texts_clean: pd.Series, artifact_dir: str) -> Tuple[np.ndarray, n
 
 
 def predict_dl(texts_clean: pd.Series, artifact_dir: str) -> Tuple[np.ndarray, np.ndarray, List[str], Dict]:
-    from tensorflow.keras.preprocessing.sequence import pad_sequences
-
     model, tokenizer, metadata, labels, thresholds, max_len = load_dl_artifact(artifact_dir)
     seq = tokenizer.texts_to_sequences(texts_clean.tolist())
-    padded = pad_sequences(seq, maxlen=max_len, padding="post", truncating="post")
-    scores = model.predict(padded, verbose=0)
+    padded = pad_sequences_compat(seq, max_len=max_len)
+    scores = np.asarray(model.predict(padded, verbose=0), dtype=float)
     y_pred = (scores >= thresholds).astype(int)
     return y_pred, scores, labels, metadata
 

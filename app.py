@@ -185,24 +185,102 @@ def load_dl_assets(model_path: str, tokenizer_path: str):
     return model, tokenizer
 
 
+def _has_predict_interface(obj) -> bool:
+    """Return True if an object looks like a scikit-learn estimator or pipeline."""
+    return any(
+        hasattr(obj, attr)
+        for attr in ("predict_proba", "decision_function", "predict")
+    )
+
+
+def _get_first_available(mapping: Dict, keys: List[str]):
+    """Return the first non-None value from a dictionary using a list of possible keys."""
+    for key in keys:
+        if key in mapping and mapping[key] is not None:
+            return mapping[key]
+    return None
+
+
+def unpack_ml_model_artifact(artifact):
+    """
+    Make ML loading tolerant to several common joblib formats.
+
+    Supported formats include:
+    - a full sklearn Pipeline or estimator
+    - {'model': pipeline_or_estimator}
+    - {'classifier': classifier, 'vectorizer': vectorizer}
+    - {'clf': classifier, 'tfidf': vectorizer}
+    - {'best_model': pipeline_or_estimator}
+    - a dict with exactly one sklearn-like object inside
+    """
+    if not isinstance(artifact, dict):
+        return artifact, None
+
+    vectorizer_keys = [
+        "vectorizer",
+        "tfidf",
+        "tfidf_vectorizer",
+        "count_vectorizer",
+        "cv",
+        "vect",
+    ]
+    model_keys = [
+        "model",
+        "classifier",
+        "clf",
+        "estimator",
+        "pipeline",
+        "best_model",
+        "final_model",
+        "ml_model",
+        "sklearn_model",
+        "text_clf",
+    ]
+
+    vectorizer = _get_first_available(artifact, vectorizer_keys)
+    classifier = _get_first_available(artifact, model_keys)
+
+    # Fallback: if the dict contains exactly one sklearn-like object, use it.
+    if classifier is None:
+        predict_like_items = [
+            (key, value)
+            for key, value in artifact.items()
+            if _has_predict_interface(value)
+        ]
+        if len(predict_like_items) == 1:
+            classifier = predict_like_items[0][1]
+
+    # Fallback: prefer a sklearn Pipeline-like object if present among many objects.
+    if classifier is None:
+        for _, value in artifact.items():
+            if _has_predict_interface(value) and hasattr(value, "steps"):
+                classifier = value
+                break
+
+    if classifier is None:
+        available_keys = ", ".join(map(str, artifact.keys()))
+        raise ValueError(
+            "ML model artifact is a dictionary, but no sklearn-compatible model was found. "
+            "Please save the model as a full sklearn Pipeline, or use one of these keys: "
+            f"{', '.join(model_keys)}. Available keys in your file: {available_keys}"
+        )
+
+    return classifier, vectorizer
+
+
 def predict_with_ml(model, texts: List[str], labels: List[str]) -> np.ndarray:
     """
     Supports common sklearn patterns:
-    1. Pipeline/OneVsRestClassifier with predict_proba
+    1. Full Pipeline/OneVsRestClassifier with predict_proba
     2. Pipeline/model with decision_function
     3. Pipeline/model with predict
-    4. Saved dict {'model': ..., 'vectorizer': ...}
+    4. Saved dict containing a classifier and optionally a vectorizer
     """
+    model, vectorizer = unpack_ml_model_artifact(model)
     x = texts
 
-    if isinstance(model, dict):
-        vectorizer = model.get("vectorizer")
-        classifier = model.get("model") or model.get("classifier")
-        if vectorizer is not None:
-            x = vectorizer.transform(texts)
-        if classifier is None:
-            raise ValueError("ML model dict must contain key 'model' or 'classifier'.")
-        model = classifier
+    if vectorizer is not None:
+        x = vectorizer.transform(texts)
 
     if hasattr(model, "predict_proba"):
         raw = model.predict_proba(x)
@@ -214,7 +292,10 @@ def predict_with_ml(model, texts: List[str], labels: List[str]) -> np.ndarray:
         raw = model.predict(x)
         probabilities = infer_probabilities_from_predict_output(raw, labels)
     else:
-        raise ValueError("Unsupported ML model. Provide a sklearn-compatible model or pipeline.")
+        raise ValueError(
+            "Unsupported ML model. Provide a sklearn-compatible model, pipeline, "
+            "or dictionary containing one."
+        )
 
     return np.clip(probabilities, 0, 1)
 

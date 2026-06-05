@@ -272,7 +272,55 @@ def _version_of(module) -> str:
     return getattr(module, "__version__", "unknown") if module is not None else "not installed"
 
 
+def _major_version(version: str) -> Optional[int]:
+    try:
+        return int(str(version).split(".")[0])
+    except Exception:
+        return None
+
+
+def _is_keras3_serialized_model(model_path: str) -> bool:
+    """Detect a Keras 3 `.keras` artifact without importing Keras.
+
+    Keras 3 native model files are zip files. In this user's case the config
+    references modules such as `keras.src.models.functional`, which Keras 2.15
+    cannot deserialize.
+    """
+    path = Path(model_path)
+    if path.suffix.lower() != ".keras" or not path.exists():
+        return False
+    try:
+        if not zipfile.is_zipfile(path):
+            return False
+        with zipfile.ZipFile(path, "r") as zf:
+            names = set(zf.namelist())
+            if "config.json" not in names:
+                return False
+            config_text = zf.read("config.json").decode("utf-8", errors="ignore")
+        return "keras.src" in config_text or "DTypePolicy" in config_text
+    except Exception:
+        return False
+
+
+def _ensure_compatible_dl_runtime(model_path: str) -> None:
+    """Fail early with a useful message when a Keras 3 model meets Keras 2 runtime."""
+    keras_version = _version_of(standalone_keras)
+    keras_major = _major_version(keras_version)
+    if _is_keras3_serialized_model(model_path) and (keras_major is None or keras_major < 3):
+        raise RuntimeError(
+            "Model DL ini tampaknya disimpan dengan format Keras 3 `.keras`, "
+            "tetapi environment deploy masih memakai Keras/TensorFlow lama.\n\n"
+            f"Versi terdeteksi: tensorflow={_version_of(tf)}, keras={keras_version}.\n\n"
+            "Perbaikan yang perlu dilakukan:\n"
+            "1. Pastikan file `requirements.txt` di GitHub berisi `tensorflow==2.16.2` dan `keras==3.4.1`.\n"
+            "2. Deploy dengan Python 3.11 di Streamlit Community Cloud.\n"
+            "3. Jika app lama masih memakai TensorFlow/Keras 2.15, delete app lalu deploy ulang, jangan hanya reboot.\n"
+            "4. Setelah deploy, cek kembali log. Seharusnya tidak lagi tertulis `tensorflow=2.15.1` dan `keras=2.15.0`."
+        )
+
+
 def _load_keras_model_robust(model_path: str):
+    _ensure_compatible_dl_runtime(model_path)
     """Load a Keras model with fallbacks for Keras 3 / tf.keras differences.
 
     The user's DL model may have been saved with standalone Keras 3, where the
@@ -718,6 +766,17 @@ with st.sidebar:
     ml_model_path = st.text_input("Path model ML (.joblib/.pkl)", "models/best_ml_model.joblib")
     dl_model_path = st.text_input("Path model DL (.keras/.h5)", "models/best_dl_model.keras")
     tokenizer_path = st.text_input("Path tokenizer DL (.pkl/.joblib)", "models/tokenizer.pkl")
+
+    if model_choice == "Deep Learning":
+        with st.expander("Info runtime Deep Learning"):
+            st.write(f"TensorFlow: `{_version_of(tf)}`")
+            st.write(f"Keras: `{_version_of(standalone_keras)}`")
+            if _major_version(_version_of(standalone_keras)) is not None and _major_version(_version_of(standalone_keras)) < 3:
+                st.warning(
+                    "Runtime saat ini masih Keras 2.x. Model `.keras` yang dibuat dengan Keras 3 "
+                    "harus dijalankan dengan `tensorflow==2.16.2` dan `keras==3.4.1`."
+                )
+
     max_len = st.number_input("Max sequence length DL", min_value=16, max_value=1024, value=200, step=8)
     batch_size = st.number_input("Batch size DL", min_value=1, max_value=512, value=32, step=1)
 
@@ -846,7 +905,11 @@ if st.button("🚀 Klasifikasikan peer feedback", type="primary"):
         st.error(
             f"File model tidak ditemukan: {e}. Pastikan file model sudah berada di folder `models/` atau ubah path pada sidebar."
         )
+    except RuntimeError as e:
+        # RuntimeError from the model loader is already written as a user-friendly message.
+        st.error(str(e))
     except Exception as e:
+        st.error("Terjadi error saat klasifikasi. Detail teknis ditampilkan di bawah untuk debugging.")
         st.exception(e)
 
 if (

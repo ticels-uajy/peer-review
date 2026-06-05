@@ -100,11 +100,6 @@ RESULT_STATE_KEYS = [
 
 
 def clear_classification_results() -> None:
-    """Remove previous classification outputs from the UI.
-
-    This keeps Streamlit from showing stale ML results after the user switches
-    to DL mode, or stale DL results after the user switches back to ML mode.
-    """
     for key in RESULT_STATE_KEYS:
         st.session_state.pop(key, None)
 
@@ -113,14 +108,12 @@ def clear_classification_results() -> None:
 # Utility functions
 # -----------------------------------------------------------------------------
 def normalize_text(text: str) -> str:
-    """Light text cleaning for display, wordcloud, and fallback preprocessing."""
     text = "" if pd.isna(text) else str(text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
 
 def parse_custom_stopwords(raw_text: str) -> Set[str]:
-    """Parse comma/newline/space-separated stopwords from the sidebar."""
     raw_text = normalize_text(raw_text).lower()
     if not raw_text:
         return set()
@@ -132,7 +125,6 @@ def parse_custom_stopwords(raw_text: str) -> Set[str]:
 
 
 def clean_for_wordcloud(text: str, stopwords: Optional[Set[str]] = None) -> str:
-    """Clean text and remove stopwords before generating a wordcloud."""
     stopwords = {word.lower() for word in (stopwords or set())}
     text = normalize_text(text).lower()
     text = re.sub(r"[^a-zA-ZÀ-ÿ0-9\s]", " ", text)
@@ -186,14 +178,6 @@ def predictions_to_label_string(predictions: np.ndarray, labels: List[str]) -> L
 
 
 def enforce_neutral_rule(predictions: np.ndarray, labels: List[str]) -> np.ndarray:
-    """
-    Optional practical rule:
-    - If Problem/Appreciation/Suggestion is predicted, Neutral is set to 0.
-    - If no non-neutral label is predicted, Neutral is set to 1.
-
-    This is often suitable when Neutral means "no specific feedback act".
-    Disable from the sidebar if your dataset allows Neutral to co-occur with others.
-    """
     if "Neutral" not in labels:
         return predictions
 
@@ -220,9 +204,6 @@ def probabilities_to_predictions(
 
 
 def infer_probabilities_from_predict_output(y_pred, labels: List[str]) -> np.ndarray:
-    """
-    Converts several common sklearn outputs to a 2D probability-like matrix.
-    """
     # Some sklearn multi-output predict_proba returns list of arrays: one array per label.
     if isinstance(y_pred, list):
         probs = []
@@ -280,12 +261,6 @@ def _major_version(version: str) -> Optional[int]:
 
 
 def _is_keras3_serialized_model(model_path: str) -> bool:
-    """Detect a Keras 3 `.keras` artifact without importing Keras.
-
-    Keras 3 native model files are zip files. In this user's case the config
-    references modules such as `keras.src.models.functional`, which Keras 2.15
-    cannot deserialize.
-    """
     path = Path(model_path)
     if path.suffix.lower() != ".keras" or not path.exists():
         return False
@@ -303,7 +278,6 @@ def _is_keras3_serialized_model(model_path: str) -> bool:
 
 
 def _ensure_compatible_dl_runtime(model_path: str) -> None:
-    """Fail early with a useful message when a Keras 3 model meets Keras 2 runtime."""
     keras_version = _version_of(standalone_keras)
     keras_major = _major_version(keras_version)
     if _is_keras3_serialized_model(model_path) and (keras_major is None or keras_major < 3):
@@ -320,7 +294,6 @@ def _ensure_compatible_dl_runtime(model_path: str) -> None:
 
 
 def _load_keras_model_robust(model_path: str):
-    """Load a Keras model with fallbacks for Keras 3 / tf.keras differences."""
     _ensure_compatible_dl_runtime(model_path)
     loaders = []
     if standalone_keras is not None:
@@ -377,7 +350,6 @@ def load_dl_assets(model_path: str, tokenizer_path: str):
 
 
 def _has_predict_interface(obj) -> bool:
-    """Return True if an object looks like a scikit-learn estimator or pipeline."""
     return any(
         hasattr(obj, attr)
         for attr in ("predict_proba", "decision_function", "predict")
@@ -385,7 +357,6 @@ def _has_predict_interface(obj) -> bool:
 
 
 def _get_first_available(mapping: Dict, keys: List[str]):
-    """Return the first non-None value from a dictionary using a list of possible keys."""
     for key in keys:
         if key in mapping and mapping[key] is not None:
             return mapping[key]
@@ -393,17 +364,6 @@ def _get_first_available(mapping: Dict, keys: List[str]):
 
 
 def unpack_ml_model_artifact(artifact):
-    """
-    Make ML loading tolerant to several common joblib formats.
-
-    Supported formats include:
-    - a full sklearn Pipeline or estimator
-    - {'model': pipeline_or_estimator}
-    - {'classifier': classifier, 'vectorizer': vectorizer}
-    - {'clf': classifier, 'tfidf': vectorizer}
-    - {'best_model': pipeline_or_estimator}
-    - a dict with exactly one sklearn-like object inside
-    """
     if not isinstance(artifact, dict):
         return artifact, None
 
@@ -460,13 +420,6 @@ def unpack_ml_model_artifact(artifact):
 
 
 def predict_with_ml(model, texts: List[str], labels: List[str]) -> np.ndarray:
-    """
-    Supports common sklearn patterns:
-    1. Full Pipeline/OneVsRestClassifier with predict_proba
-    2. Pipeline/model with decision_function
-    3. Pipeline/model with predict
-    4. Saved dict containing a classifier and optionally a vectorizer
-    """
     model, vectorizer = unpack_ml_model_artifact(model)
     x = texts
 
@@ -593,7 +546,6 @@ def save_outputs_to_folder(
     metadata: Dict,
     output_base_dir: Path = OUTPUT_DIR,
 ) -> Dict[str, Path]:
-    """Save classification results and learning insights to a timestamped folder."""
     output_base_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -634,7 +586,6 @@ def save_outputs_to_folder(
 
 
 def zip_run_folder(run_dir: Path) -> bytes:
-    """Create an in-memory ZIP from a saved output folder."""
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
         for path in sorted(run_dir.rglob("*")):

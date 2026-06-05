@@ -5,24 +5,35 @@ import zipfile
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import joblib
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import streamlit as st
-from wordcloud import WordCloud
+from wordcloud import STOPWORDS, WordCloud
 
 # Optional imports for deep learning model.
-# The app will still run for ML mode even if TensorFlow is not installed,
+# The app will still run for ML mode even if TensorFlow/Keras is not installed,
 # as long as DL mode is not selected.
 try:
     import tensorflow as tf
-    from tensorflow.keras.preprocessing.sequence import pad_sequences
 except Exception:  # pragma: no cover
     tf = None
-    pad_sequences = None
+
+try:
+    import keras as standalone_keras
+except Exception:  # pragma: no cover
+    standalone_keras = None
+
+try:
+    from tensorflow.keras.preprocessing.sequence import pad_sequences
+except Exception:  # pragma: no cover
+    try:
+        from keras.utils import pad_sequences
+    except Exception:
+        pad_sequences = None
 
 
 APP_TITLE = "Peer Feedback Multi-label Classification"
@@ -30,11 +41,72 @@ DEFAULT_LABELS = ["Problem", "Appreciation", "Suggestion", "Neutral"]
 MODEL_DIR = Path("models")
 OUTPUT_DIR = Path("outputs")
 
+# Stopwords used only for wordcloud visualization. Keep this list conservative so
+# words that are useful for learning insight, such as "kurang", "baik", "jelas",
+# "problem", or "suggestion", are not accidentally removed.
+INDONESIAN_WORDCLOUD_STOPWORDS = {
+    "ada", "adalah", "agar", "akan", "akhir", "antara", "apa", "apabila",
+    "atas", "atau", "bahwa", "bagi", "bagian", "banyak", "baru", "begini",
+    "begitu", "belum", "berada", "berikut", "bersama", "berturut", "bila",
+    "bisa", "buat", "cara", "cukup", "dalam", "dan", "dapat", "dari",
+    "daripada", "dengan", "demi", "demikian", "dengan", "depan", "di", "dia",
+    "diri", "dulu", "hal", "hanya", "harus", "hingga", "ia", "ini", "itu",
+    "jadi", "jika", "juga", "justru", "kala", "kalau", "kami", "kamu",
+    "kan", "karena", "kata", "ke", "kembali", "kemudian", "kepada", "ketika",
+    "kita", "lagi", "lain", "lalu", "lewat", "maka", "makin", "malah",
+    "mana", "masih", "maupun", "melalui", "memang", "mereka", "meski",
+    "misal", "misalnya", "namun", "nanti", "nya", "oleh", "orang", "pada",
+    "paling", "para", "per", "perlu", "pun", "saat", "saja", "saling",
+    "sama", "sambil", "sampai", "sana", "sangat", "saya", "sebagai",
+    "sebelum", "sebuah", "secara", "sedang", "sedangkan", "sedikit",
+    "sehingga", "sejak", "sekali", "sekitar", "selain", "selalu", "seluruh",
+    "semakin", "semua", "sementara", "sempat", "sendiri", "seolah", "seperti",
+    "serta", "setelah", "setiap", "suatu", "sudah", "supaya", "tanpa", "tapi",
+    "telah", "tentang", "tentu", "terhadap", "tersebut", "tetapi", "tiap",
+    "tidak", "tujuan", "untuk", "usah", "yaitu", "yakni", "yang",
+}
+
+DOMAIN_WORDCLOUD_STOPWORDS = {
+    "feedback", "peer", "review", "comment", "comments", "student", "students",
+    "teks", "text", "label", "labels",
+}
+
+DEFAULT_WORDCLOUD_STOPWORDS = (
+    set(STOPWORDS)
+    | INDONESIAN_WORDCLOUD_STOPWORDS
+    | DOMAIN_WORDCLOUD_STOPWORDS
+)
+
 st.set_page_config(
     page_title=APP_TITLE,
     page_icon="🧠",
     layout="wide",
 )
+
+
+# -----------------------------------------------------------------------------
+# Session-state helpers
+# -----------------------------------------------------------------------------
+RESULT_STATE_KEYS = [
+    "classification_result_df",
+    "label_count_df",
+    "combination_df",
+    "summary",
+    "saved_paths",
+    "active_labels",
+    "active_text_col",
+    "active_model_choice",
+]
+
+
+def clear_classification_results() -> None:
+    """Remove previous classification outputs from the UI.
+
+    This keeps Streamlit from showing stale ML results after the user switches
+    to DL mode, or stale DL results after the user switches back to ML mode.
+    """
+    for key in RESULT_STATE_KEYS:
+        st.session_state.pop(key, None)
 
 
 # -----------------------------------------------------------------------------
@@ -47,11 +119,33 @@ def normalize_text(text: str) -> str:
     return text
 
 
-def clean_for_wordcloud(text: str) -> str:
+def parse_custom_stopwords(raw_text: str) -> Set[str]:
+    """Parse comma/newline/space-separated stopwords from the sidebar."""
+    raw_text = normalize_text(raw_text).lower()
+    if not raw_text:
+        return set()
+    return {
+        item.strip()
+        for item in re.split(r"[\s,;]+", raw_text)
+        if item.strip()
+    }
+
+
+def clean_for_wordcloud(text: str, stopwords: Optional[Set[str]] = None) -> str:
+    """Clean text and remove stopwords before generating a wordcloud."""
+    stopwords = {word.lower() for word in (stopwords or set())}
     text = normalize_text(text).lower()
     text = re.sub(r"[^a-zA-ZÀ-ÿ0-9\s]", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+    words = []
+    for word in text.split():
+        if word in stopwords:
+            continue
+        if word.isdigit():
+            continue
+        if len(word) <= 1:
+            continue
+        words.append(word)
+    return " ".join(words)
 
 
 def slugify(value: str, default: str = "output") -> str:
@@ -174,13 +268,70 @@ def load_ml_model(model_path: str):
     return joblib.load(model_path)
 
 
+def _version_of(module) -> str:
+    return getattr(module, "__version__", "unknown") if module is not None else "not installed"
+
+
+def _load_keras_model_robust(model_path: str):
+    """Load a Keras model with fallbacks for Keras 3 / tf.keras differences.
+
+    The user's DL model may have been saved with standalone Keras 3, where the
+    serialized config can reference modules such as `keras.src.models.functional`.
+    Loading that artifact with an older or mismatched tf.keras can fail.
+    Therefore, prefer standalone Keras when it is available, then fall back to
+    tf.keras, and always try compile=False first because this app only needs
+    inference.
+    """
+    loaders = []
+    if standalone_keras is not None:
+        loaders.append(("keras.models.load_model", standalone_keras.models.load_model))
+    if tf is not None:
+        loaders.append(("tf.keras.models.load_model", tf.keras.models.load_model))
+
+    if not loaders:
+        raise ImportError(
+            "TensorFlow/Keras is not installed. Install TensorFlow or Keras to use DL mode."
+        )
+
+    attempts = []
+    kwargs_candidates = [
+        {"compile": False, "safe_mode": False},
+        {"compile": False},
+        {},
+    ]
+
+    for loader_name, loader in loaders:
+        for kwargs in kwargs_candidates:
+            try:
+                return loader(model_path, **kwargs)
+            except TypeError as exc:
+                # Some older loaders do not accept safe_mode. Try the next kwargs.
+                attempts.append(f"{loader_name}{kwargs}: {type(exc).__name__}: {exc}")
+            except Exception as exc:
+                attempts.append(f"{loader_name}{kwargs}: {type(exc).__name__}: {exc}")
+
+    detail = "\n".join(f"- {item}" for item in attempts[-6:])
+    raise RuntimeError(
+        "Model DL gagal dimuat. Kemungkinan besar file model disimpan dengan "
+        "versi Keras/TensorFlow yang berbeda dari environment deploy.\n\n"
+        f"Versi terdeteksi: tensorflow={_version_of(tf)}, keras={_version_of(standalone_keras)}.\n\n"
+        "Yang bisa dilakukan:\n"
+        "1. Gunakan requirements.txt versi Keras 3/TensorFlow 2.16+ yang disertakan pada ZIP ini.\n"
+        "2. Deploy dengan Python 3.11.\n"
+        "3. Jika masih gagal, simpan ulang model dari environment training dengan `model.save('best_dl_model.keras')` "
+        "lalu gunakan versi TensorFlow/Keras yang sama saat deploy.\n\n"
+        "Ringkasan percobaan loader terakhir:\n"
+        f"{detail}"
+    )
+
+
 @st.cache_resource(show_spinner=False)
 def load_dl_assets(model_path: str, tokenizer_path: str):
-    if tf is None:
+    if pad_sequences is None:
         raise ImportError(
-            "TensorFlow is not installed. Install it with `pip install tensorflow` to use DL mode."
+            "pad_sequences tidak tersedia. Pastikan TensorFlow/Keras terinstall dengan benar."
         )
-    model = tf.keras.models.load_model(model_path)
+    model = _load_keras_model_robust(model_path)
     tokenizer = joblib.load(tokenizer_path)
     return model, tokenizer
 
@@ -477,10 +628,14 @@ def render_saved_output_section(paths: Dict[str, Path]):
     )
 
 
-def render_wordcloud(text: str, title: str):
-    text = clean_for_wordcloud(text)
+def render_wordcloud(text: str, title: str, stopwords: Optional[Set[str]] = None):
+    stopwords = stopwords or set()
+    text = clean_for_wordcloud(text, stopwords=stopwords)
     if not text:
-        st.info(f"Tidak ada teks yang cukup untuk membuat wordcloud label {title}.")
+        st.info(
+            f"Tidak ada teks yang cukup untuk membuat wordcloud label {title} "
+            "setelah stopwords dibuang."
+        )
         return
 
     wc = WordCloud(
@@ -489,6 +644,7 @@ def render_wordcloud(text: str, title: str):
         background_color="white",
         collocations=False,
         max_words=150,
+        stopwords=stopwords,
     ).generate(text)
 
     fig, ax = plt.subplots(figsize=(10, 5))
@@ -517,7 +673,16 @@ with st.sidebar:
         "Pilih model terbaik",
         options=["Machine Learning", "Deep Learning"],
         index=0,
+        key="model_choice",
     )
+
+    previous_model_choice = st.session_state.get("_previous_model_choice")
+    if previous_model_choice is None:
+        st.session_state["_previous_model_choice"] = model_choice
+    elif previous_model_choice != model_choice:
+        clear_classification_results()
+        st.session_state["_previous_model_choice"] = model_choice
+        st.info("Pilihan model berubah. Hasil klasifikasi sebelumnya disembunyikan sampai klasifikasi dijalankan ulang.")
 
     threshold = st.slider(
         "Threshold klasifikasi multi-label",
@@ -532,6 +697,20 @@ with st.sidebar:
         "Gunakan aturan Neutral eksklusif",
         value=True,
         help="Jika Problem/Appreciation/Suggestion muncul, Neutral dibuat 0. Jika tidak ada label lain, Neutral dibuat 1.",
+    )
+
+    st.divider()
+    st.subheader("Wordcloud")
+    use_default_stopwords = st.checkbox(
+        "Buang stopwords Indonesia + Inggris",
+        value=True,
+        help="Jika aktif, kata umum seperti yang, dan, di, the, and, of, serta kata domain umum dibuang dari wordcloud.",
+    )
+    custom_stopwords_text = st.text_area(
+        "Stopwords tambahan",
+        value="",
+        height=90,
+        help="Pisahkan dengan koma, spasi, titik koma, atau baris baru. Contoh: tugas, materi, kelompok",
     )
 
     st.divider()
@@ -550,6 +729,11 @@ with st.sidebar:
         help="Jika aktif, hasil klasifikasi dan learning insights disimpan ke folder outputs/ setiap kali proses klasifikasi selesai.",
     )
     output_base_dir = st.text_input("Folder output", "outputs")
+
+wordcloud_stopwords: Set[str] = set()
+if use_default_stopwords:
+    wordcloud_stopwords.update(DEFAULT_WORDCLOUD_STOPWORDS)
+wordcloud_stopwords.update(parse_custom_stopwords(custom_stopwords_text))
 
 uploaded_file = st.file_uploader("Upload file CSV berisi teks peer feedback", type=["csv"])
 
@@ -630,6 +814,9 @@ if st.button("🚀 Klasifikasikan peer feedback", type="primary"):
                 "model_path": selected_model_path,
                 "threshold": float(threshold),
                 "use_neutral_rule": bool(use_neutral_rule),
+                "use_default_wordcloud_stopwords": bool(use_default_stopwords),
+                "custom_wordcloud_stopwords": sorted(parse_custom_stopwords(custom_stopwords_text)),
+                "wordcloud_stopwords_count": int(len(wordcloud_stopwords)),
                 "labels": labels,
                 "total_rows": int(len(result_df)),
             }
@@ -651,6 +838,7 @@ if st.button("🚀 Klasifikasikan peer feedback", type="primary"):
         st.session_state["saved_paths"] = saved_paths
         st.session_state["active_labels"] = labels
         st.session_state["active_text_col"] = text_col
+        st.session_state["active_model_choice"] = model_choice
 
         st.success("Klasifikasi selesai.")
 
@@ -661,7 +849,10 @@ if st.button("🚀 Klasifikasikan peer feedback", type="primary"):
     except Exception as e:
         st.exception(e)
 
-if "classification_result_df" in st.session_state:
+if (
+    "classification_result_df" in st.session_state
+    and st.session_state.get("active_model_choice", model_choice) == model_choice
+):
     result_df = st.session_state["classification_result_df"]
     label_count_df = st.session_state["label_count_df"]
     combination_df = st.session_state["combination_df"]
@@ -700,11 +891,15 @@ if "classification_result_df" in st.session_state:
             st.bar_chart(combination_df.set_index("Label combination")["Count"])
 
     st.subheader("4. Wordcloud per label")
+    st.caption(
+        f"Wordcloud dibuat setelah membuang {len(wordcloud_stopwords)} stopwords "
+        "dan token yang terlalu pendek/berupa angka."
+    )
     tabs = st.tabs(labels)
     for tab, label in zip(tabs, labels):
         with tab:
             label_texts = result_df.loc[result_df[f"pred_{label}"] == 1, text_col].tolist()
-            render_wordcloud(" ".join(label_texts), label)
+            render_wordcloud(" ".join(label_texts), label, stopwords=wordcloud_stopwords)
 
     st.subheader("5. Summary learning insight")
     st.write(summary)

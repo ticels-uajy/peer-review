@@ -1,22 +1,9 @@
-"""
-Streamlit app for multi-label peer feedback classification.
-
-Expected artifact structure inside ARTIFACT_DIR:
-- best_ml_model.joblib
-- best_ml_model_metadata.json
-- best_dl_model.keras                 optional, needed for DL inference
-- best_dl_tokenizer.joblib             optional, needed for DL inference
-- best_dl_model_metadata.json          optional, needed for DL inference
-
-Run:
-    streamlit run app.py
-"""
-
-from __future__ import annotations
-
+import io
 import json
 import re
-from io import BytesIO
+import zipfile
+from collections import Counter
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -25,533 +12,640 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import streamlit as st
-from PIL import Image
-from sklearn.base import BaseEstimator, ClassifierMixin, clone
-from sklearn.calibration import CalibratedClassifierCV
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import classification_report, multilabel_confusion_matrix
-from sklearn.preprocessing import LabelEncoder
 from wordcloud import WordCloud
 
-# Keras/TensorFlow is imported lazily only when DL is used.
-# DL models saved with Keras 3 must be loaded with standalone keras, not older tf.keras.
+# Optional imports for deep learning model.
+# The app will still run for ML mode even if TensorFlow is not installed,
+# as long as DL mode is not selected.
+try:
+    import tensorflow as tf
+    from tensorflow.keras.preprocessing.sequence import pad_sequences
+except Exception:  # pragma: no cover
+    tf = None
+    pad_sequences = None
 
 
-# -----------------------------------------------------------------------------
-# Custom classes needed for joblib compatibility
-# -----------------------------------------------------------------------------
-def labelset_strings(y: np.ndarray) -> np.ndarray:
-    """Convert a binary multi-label matrix to label powerset strings."""
-    return np.array(["".join(map(str, row.astype(int))) for row in y])
+APP_TITLE = "Peer Feedback Multi-label Classification"
+DEFAULT_LABELS = ["Problem", "Appreciation", "Suggestion", "Neutral"]
+MODEL_DIR = Path("models")
+OUTPUT_DIR = Path("outputs")
 
-
-class LabelPowersetClassifier(BaseEstimator, ClassifierMixin):
-    """Sklearn-compatible label powerset wrapper used by the training pipeline."""
-
-    def __init__(self, base_estimator=None):
-        self.base_estimator = (
-            base_estimator
-            if base_estimator is not None
-            else LogisticRegression(max_iter=2000, class_weight="balanced")
-        )
-
-    def fit(self, X, y):
-        self.n_labels_ = y.shape[1]
-        label_strings = labelset_strings(np.asarray(y))
-        self.encoder_ = LabelEncoder().fit(label_strings)
-        self.estimator_ = clone(self.base_estimator)
-        self.estimator_.fit(X, self.encoder_.transform(label_strings))
-        return self
-
-    def predict(self, X):
-        pred_strings = self.encoder_.inverse_transform(self.estimator_.predict(X))
-        return np.array([[int(ch) for ch in s] for s in pred_strings], dtype=int)
-
-
-class SafeCalibratedClassifierCV(BaseEstimator, ClassifierMixin):
-    """Safe calibration wrapper used by the training pipeline."""
-
-    def __init__(self, estimator=None, cv=3):
-        self.estimator = estimator
-        self.cv = cv
-
-    def fit(self, X, y):
-        y_arr = np.asarray(y)
-        _, counts = np.unique(y_arr, return_counts=True)
-        estimator = self.estimator if self.estimator is not None else LogisticRegression(max_iter=2000)
-        can_calibrate = len(counts) >= 2 and int(counts.min()) >= int(self.cv)
-
-        if can_calibrate:
-            self.model_ = CalibratedClassifierCV(estimator=clone(estimator), cv=self.cv)
-            self.calibration_mode_ = f"calibrated_cv_{self.cv}"
-        else:
-            self.model_ = clone(estimator)
-            self.calibration_mode_ = "fallback_uncalibrated_due_to_rare_class"
-
-        self.model_.fit(X, y_arr)
-        self.classes_ = getattr(self.model_, "classes_", None)
-        return self
-
-    def predict(self, X):
-        return self.model_.predict(X)
-
-    def predict_proba(self, X):
-        if hasattr(self.model_, "predict_proba"):
-            return self.model_.predict_proba(X)
-        raise AttributeError("The fitted estimator does not provide predict_proba.")
-
-    def decision_function(self, X):
-        if hasattr(self.model_, "decision_function"):
-            return self.model_.decision_function(X)
-        raise AttributeError("The fitted estimator does not provide decision_function.")
-
-
-# -----------------------------------------------------------------------------
-# Configuration
-# -----------------------------------------------------------------------------
-DEFAULT_LABELS = ["Appreciation", "Problem", "Suggestion", "Neutral"]
-DEFAULT_ARTIFACT_DIR = "artifacts/latest_run"
-
-STOPWORDS_ID = {
-    "yang", "dan", "di", "ke", "dari", "ini", "itu", "untuk", "dengan", "pada", "dalam",
-    "adalah", "atau", "juga", "karena", "sebagai", "lebih", "agar", "akan", "sudah", "belum",
-    "tidak", "bisa", "dapat", "sangat", "masih", "ada", "jadi", "tersebut", "nya", "the",
-    "a", "an", "and", "or", "to", "of", "in", "is", "are", "for", "with", "on", "this",
-}
+st.set_page_config(
+    page_title=APP_TITLE,
+    page_icon="🧠",
+    layout="wide",
+)
 
 
 # -----------------------------------------------------------------------------
 # Utility functions
 # -----------------------------------------------------------------------------
-def preprocess_text(text: object) -> str:
-    """Simple text normalization consistent with the modelling pipeline."""
-    if pd.isna(text):
-        return ""
-    text = str(text)
-    text = text.lower()
-    text = re.sub(r"https?://\S+|www\.\S+", " ", text)
-    text = re.sub(r"\S+@\S+", " ", text)
-    text = re.sub(r"[^0-9a-zA-ZÀ-ÿ_\s\-]", " ", text)
+def normalize_text(text: str) -> str:
+    """Light text cleaning for display, wordcloud, and fallback preprocessing."""
+    text = "" if pd.isna(text) else str(text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
 
-def read_json(path: Path) -> Dict:
+def clean_for_wordcloud(text: str) -> str:
+    text = normalize_text(text).lower()
+    text = re.sub(r"[^a-zA-ZÀ-ÿ0-9\s]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def slugify(value: str, default: str = "output") -> str:
+    value = normalize_text(value).lower()
+    value = re.sub(r"[^a-z0-9_-]+", "_", value)
+    value = re.sub(r"_+", "_", value).strip("_")
+    return value or default
+
+
+def load_labels(path: Path = MODEL_DIR / "labels.json") -> List[str]:
     if path.exists():
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+            labels = json.load(f)
+        if isinstance(labels, dict) and "labels" in labels:
+            labels = labels["labels"]
+        return list(labels)
+    return DEFAULT_LABELS
 
 
-def thresholds_from_metadata(metadata: Dict, labels: List[str]) -> np.ndarray:
-    raw = metadata.get("thresholds", {})
-    if isinstance(raw, dict):
-        return np.array([float(raw.get(label, 0.5)) for label in labels], dtype=float)
-    if isinstance(raw, list):
-        arr = np.array(raw, dtype=float)
-        if len(arr) == len(labels):
-            return arr
-    return np.array([0.5] * len(labels), dtype=float)
+def safe_columns(df: pd.DataFrame) -> List[str]:
+    return [str(c) for c in df.columns]
 
 
-def normalize_scores(scores: np.ndarray) -> np.ndarray:
-    """Map decision scores to [0,1] with sigmoid when needed."""
-    scores = np.asarray(scores, dtype=float)
-    if scores.ndim == 1:
-        scores = scores.reshape(-1, 1)
-    if np.nanmin(scores) < 0 or np.nanmax(scores) > 1:
-        scores = 1.0 / (1.0 + np.exp(-scores))
-    return scores
+def get_probability_columns(labels: List[str]) -> List[str]:
+    return [f"prob_{label}" for label in labels]
 
 
-def predict_scores_or_none(model, texts: pd.Series) -> Optional[np.ndarray]:
-    if hasattr(model, "predict_proba"):
-        proba = model.predict_proba(texts)
-        if isinstance(proba, list):
-            # MultiOutputClassifier returns a list of arrays, one per label.
-            return np.vstack([p[:, 1] if p.ndim == 2 and p.shape[1] > 1 else p.ravel() for p in proba]).T
-        proba = np.asarray(proba)
-        if proba.ndim == 3:
-            return proba[:, :, 1]
-        return proba
-    if hasattr(model, "decision_function"):
-        return normalize_scores(model.decision_function(texts))
-    return None
+def get_prediction_columns(labels: List[str]) -> List[str]:
+    return [f"pred_{label}" for label in labels]
+
+
+def predictions_to_label_string(predictions: np.ndarray, labels: List[str]) -> List[str]:
+    results = []
+    for row in predictions:
+        active = [labels[i] for i, value in enumerate(row) if int(value) == 1]
+        results.append(", ".join(active) if active else "Unclassified")
+    return results
+
+
+def enforce_neutral_rule(predictions: np.ndarray, labels: List[str]) -> np.ndarray:
+    """
+    Optional practical rule:
+    - If Problem/Appreciation/Suggestion is predicted, Neutral is set to 0.
+    - If no non-neutral label is predicted, Neutral is set to 1.
+
+    This is often suitable when Neutral means "no specific feedback act".
+    Disable from the sidebar if your dataset allows Neutral to co-occur with others.
+    """
+    if "Neutral" not in labels:
+        return predictions
+
+    predictions = predictions.copy().astype(int)
+    neutral_idx = labels.index("Neutral")
+    non_neutral_indices = [i for i, label in enumerate(labels) if label != "Neutral"]
+
+    non_neutral_sum = predictions[:, non_neutral_indices].sum(axis=1)
+    predictions[non_neutral_sum > 0, neutral_idx] = 0
+    predictions[non_neutral_sum == 0, neutral_idx] = 1
+    return predictions
+
+
+def probabilities_to_predictions(
+    probabilities: np.ndarray,
+    labels: List[str],
+    threshold: float,
+    neutral_rule: bool = True,
+) -> np.ndarray:
+    predictions = (probabilities >= threshold).astype(int)
+    if neutral_rule:
+        predictions = enforce_neutral_rule(predictions, labels)
+    return predictions
+
+
+def infer_probabilities_from_predict_output(y_pred, labels: List[str]) -> np.ndarray:
+    """
+    Converts several common sklearn outputs to a 2D probability-like matrix.
+    """
+    # Some sklearn multi-output predict_proba returns list of arrays: one array per label.
+    if isinstance(y_pred, list):
+        probs = []
+        for arr in y_pred:
+            arr = np.asarray(arr)
+            if arr.ndim == 2 and arr.shape[1] >= 2:
+                probs.append(arr[:, 1])
+            else:
+                probs.append(arr.reshape(-1))
+        return np.vstack(probs).T
+
+    y_pred = np.asarray(y_pred)
+    if y_pred.ndim == 1:
+        # Single-label fallback; not ideal for multi-label, but keeps app safe.
+        out = np.zeros((len(y_pred), len(labels)), dtype=float)
+        for i, value in enumerate(y_pred):
+            if isinstance(value, str) and value in labels:
+                out[i, labels.index(value)] = 1.0
+            else:
+                try:
+                    idx = int(value)
+                    if 0 <= idx < len(labels):
+                        out[i, idx] = 1.0
+                except Exception:
+                    pass
+        return out
+
+    if y_pred.ndim == 2:
+        if y_pred.shape[1] == len(labels):
+            return y_pred.astype(float)
+        raise ValueError(
+            f"Model output has {y_pred.shape[1]} columns, but labels.json has {len(labels)} labels."
+        )
+
+    raise ValueError("Unsupported prediction/probability output format.")
+
+
+# -----------------------------------------------------------------------------
+# Model loading
+# -----------------------------------------------------------------------------
+@st.cache_resource(show_spinner=False)
+def load_ml_model(model_path: str):
+    return joblib.load(model_path)
 
 
 @st.cache_resource(show_spinner=False)
-def load_ml_artifact(artifact_dir: str) -> Tuple[object, Dict, List[str], np.ndarray]:
-    artifact_path = Path(artifact_dir)
-    model_bundle = joblib.load(artifact_path / "best_ml_model.joblib")
-    metadata = read_json(artifact_path / "best_ml_model_metadata.json")
-
-    if isinstance(model_bundle, dict):
-        model = model_bundle.get("pipeline", model_bundle.get("model", model_bundle))
-        labels = model_bundle.get("labels") or metadata.get("labels") or DEFAULT_LABELS
-        thresholds = np.asarray(model_bundle.get("thresholds", thresholds_from_metadata(metadata, labels)), dtype=float)
-    else:
-        model = model_bundle
-        labels = metadata.get("labels") or DEFAULT_LABELS
-        thresholds = thresholds_from_metadata(metadata, labels)
-
-    if len(thresholds) != len(labels):
-        thresholds = thresholds_from_metadata(metadata, labels)
-
-    return model, metadata, labels, thresholds
+def load_dl_assets(model_path: str, tokenizer_path: str):
+    if tf is None:
+        raise ImportError(
+            "TensorFlow is not installed. Install it with `pip install tensorflow` to use DL mode."
+        )
+    model = tf.keras.models.load_model(model_path)
+    tokenizer = joblib.load(tokenizer_path)
+    return model, tokenizer
 
 
-def load_keras_model_compat(model_path: Path):
-    """Load a .keras model saved by either Keras 3 or tf.keras.
-
-    The training notebook may save models with Keras 3, whose serialized config
-    contains modules such as `keras.src.models.functional`. Such models cannot be
-    deserialized by older `tf.keras` / `keras<3`. This loader therefore tries
-    standalone Keras first, then falls back to TensorFlow Keras.
+def predict_with_ml(model, texts: List[str], labels: List[str]) -> np.ndarray:
     """
-    errors = []
+    Supports common sklearn patterns:
+    1. Pipeline/OneVsRestClassifier with predict_proba
+    2. Pipeline/model with decision_function
+    3. Pipeline/model with predict
+    4. Saved dict {'model': ..., 'vectorizer': ...}
+    """
+    x = texts
 
-    try:
-        import keras  # Keras 3 standalone package
+    if isinstance(model, dict):
+        vectorizer = model.get("vectorizer")
+        classifier = model.get("model") or model.get("classifier")
+        if vectorizer is not None:
+            x = vectorizer.transform(texts)
+        if classifier is None:
+            raise ValueError("ML model dict must contain key 'model' or 'classifier'.")
+        model = classifier
 
-        return keras.saving.load_model(model_path, compile=False, safe_mode=False)
-    except Exception as exc:  # pragma: no cover - shown to the Streamlit user
-        errors.append(f"keras.saving.load_model failed: {exc}")
+    if hasattr(model, "predict_proba"):
+        raw = model.predict_proba(x)
+        probabilities = infer_probabilities_from_predict_output(raw, labels)
+    elif hasattr(model, "decision_function"):
+        scores = infer_probabilities_from_predict_output(model.decision_function(x), labels)
+        probabilities = 1 / (1 + np.exp(-scores))
+    elif hasattr(model, "predict"):
+        raw = model.predict(x)
+        probabilities = infer_probabilities_from_predict_output(raw, labels)
+    else:
+        raise ValueError("Unsupported ML model. Provide a sklearn-compatible model or pipeline.")
 
-    try:
-        from tensorflow import keras as tf_keras
+    return np.clip(probabilities, 0, 1)
 
-        return tf_keras.models.load_model(model_path, compile=False)
-    except Exception as exc:  # pragma: no cover - shown to the Streamlit user
-        errors.append(f"tf.keras.models.load_model failed: {exc}")
 
-    raise RuntimeError(
-        "Model DL tidak dapat dimuat. Kemungkinan besar versi Keras/TensorFlow "
-        "di environment Streamlit tidak sama dengan versi saat model disimpan. "
-        "Gunakan requirements terbaru: keras>=3 dan tensorflow>=2.16. Detail: "
-        + " | ".join(errors)
+def predict_with_dl(
+    model,
+    tokenizer,
+    texts: List[str],
+    labels: List[str],
+    max_len: int,
+    batch_size: int,
+) -> np.ndarray:
+    sequences = tokenizer.texts_to_sequences(texts)
+    padded = pad_sequences(sequences, maxlen=max_len, padding="post", truncating="post")
+    probabilities = model.predict(padded, batch_size=batch_size, verbose=0)
+    probabilities = infer_probabilities_from_predict_output(probabilities, labels)
+    return np.clip(probabilities, 0, 1)
+
+
+# -----------------------------------------------------------------------------
+# Insight, output saving, and visualization
+# -----------------------------------------------------------------------------
+def build_insight_tables(df_pred: pd.DataFrame, labels: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    pred_cols = get_prediction_columns(labels)
+
+    label_counts = []
+    total = len(df_pred)
+    for label, col in zip(labels, pred_cols):
+        count = int(df_pred[col].sum())
+        label_counts.append(
+            {
+                "Label": label,
+                "Count": count,
+                "Percentage": round((count / total * 100) if total else 0, 2),
+            }
+        )
+    label_count_df = pd.DataFrame(label_counts)
+
+    combination_counter = Counter(df_pred["predicted_labels"].fillna("Unclassified"))
+    combination_df = pd.DataFrame(
+        [
+            {
+                "Label combination": combo,
+                "Count": count,
+                "Percentage": round((count / total * 100) if total else 0, 2),
+            }
+            for combo, count in combination_counter.most_common()
+        ]
+    )
+
+    return label_count_df, combination_df
+
+
+def generate_summary(label_count_df: pd.DataFrame, combination_df: pd.DataFrame, total: int) -> str:
+    if total == 0 or label_count_df.empty:
+        return "Belum ada data yang dapat dirangkum."
+
+    top_label = label_count_df.sort_values("Count", ascending=False).iloc[0]
+    low_label = label_count_df.sort_values("Count", ascending=True).iloc[0]
+    top_combo = combination_df.iloc[0] if not combination_df.empty else None
+
+    problem_count = int(label_count_df.loc[label_count_df["Label"] == "Problem", "Count"].sum())
+    appreciation_count = int(label_count_df.loc[label_count_df["Label"] == "Appreciation", "Count"].sum())
+    suggestion_count = int(label_count_df.loc[label_count_df["Label"] == "Suggestion", "Count"].sum())
+    neutral_count = int(label_count_df.loc[label_count_df["Label"] == "Neutral", "Count"].sum())
+
+    sentences = [
+        f"Dari {total} peer feedback yang dianalisis, label yang paling dominan adalah {top_label['Label']} sebanyak {int(top_label['Count'])} data ({top_label['Percentage']}%).",
+        f"Label dengan kemunculan paling rendah adalah {low_label['Label']} sebanyak {int(low_label['Count'])} data ({low_label['Percentage']}%).",
+    ]
+
+    if top_combo is not None:
+        sentences.append(
+            f"Kombinasi label yang paling sering muncul adalah {top_combo['Label combination']} sebanyak {int(top_combo['Count'])} data ({top_combo['Percentage']}%)."
+        )
+
+    if problem_count > suggestion_count:
+        sentences.append(
+            "Jumlah feedback berkategori Problem lebih tinggi daripada Suggestion, sehingga pengajar dapat mempertimbangkan tindak lanjut berupa klarifikasi materi, perbaikan instruksi tugas, atau pemberian contoh tambahan."
+        )
+    elif suggestion_count > problem_count:
+        sentences.append(
+            "Jumlah Suggestion relatif menonjol, yang menunjukkan bahwa mahasiswa tidak hanya mengidentifikasi isu, tetapi juga memberikan masukan perbaikan yang dapat dimanfaatkan untuk peningkatan pembelajaran."
+        )
+
+    if appreciation_count > 0:
+        sentences.append(
+            "Kemunculan Appreciation menunjukkan adanya aspek pembelajaran atau kinerja teman sebaya yang dipersepsi positif oleh mahasiswa."
+        )
+
+    if neutral_count == total:
+        sentences.append(
+            "Seluruh feedback terklasifikasi sebagai Neutral, sehingga data mungkin berisi komentar umum yang kurang memuat evaluasi spesifik."
+        )
+
+    return " ".join(sentences)
+
+
+def save_outputs_to_folder(
+    result_df: pd.DataFrame,
+    label_count_df: pd.DataFrame,
+    combination_df: pd.DataFrame,
+    summary: str,
+    metadata: Dict,
+    output_base_dir: Path = OUTPUT_DIR,
+) -> Dict[str, Path]:
+    """Save classification results and learning insights to a timestamped folder."""
+    output_base_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    model_slug = slugify(metadata.get("model_choice", "model"))
+    upload_slug = slugify(Path(metadata.get("uploaded_filename", "uploaded_data")).stem)
+    run_dir = output_base_dir / f"run_{timestamp}_{model_slug}_{upload_slug}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    paths = {
+        "run_dir": run_dir,
+        "classification_csv": run_dir / "classification_results.csv",
+        "label_counts_csv": run_dir / "label_counts.csv",
+        "label_combinations_csv": run_dir / "label_combinations.csv",
+        "summary_txt": run_dir / "summary_learning_insight.txt",
+        "insights_json": run_dir / "learning_insights.json",
+        "metadata_json": run_dir / "metadata.json",
+    }
+
+    result_df.to_csv(paths["classification_csv"], index=False, encoding="utf-8-sig")
+    label_count_df.to_csv(paths["label_counts_csv"], index=False, encoding="utf-8-sig")
+    combination_df.to_csv(paths["label_combinations_csv"], index=False, encoding="utf-8-sig")
+
+    with open(paths["summary_txt"], "w", encoding="utf-8") as f:
+        f.write(summary)
+
+    learning_insights = {
+        "summary": summary,
+        "label_counts": label_count_df.to_dict(orient="records"),
+        "label_combinations": combination_df.to_dict(orient="records"),
+    }
+    with open(paths["insights_json"], "w", encoding="utf-8") as f:
+        json.dump(learning_insights, f, ensure_ascii=False, indent=2)
+
+    with open(paths["metadata_json"], "w", encoding="utf-8") as f:
+        json.dump(metadata, f, ensure_ascii=False, indent=2)
+
+    return paths
+
+
+def zip_run_folder(run_dir: Path) -> bytes:
+    """Create an in-memory ZIP from a saved output folder."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        for path in sorted(run_dir.rglob("*")):
+            if path.is_file():
+                zip_file.write(path, arcname=path.relative_to(run_dir))
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def render_saved_output_section(paths: Dict[str, Path]):
+    run_dir = paths.get("run_dir")
+    if not run_dir:
+        return
+
+    st.subheader("7. Penyimpanan output")
+    st.success(f"Hasil klasifikasi dan learning insights sudah disimpan ke folder `{run_dir.as_posix()}`.")
+
+    output_rows = []
+    for key, path in paths.items():
+        if key == "run_dir":
+            continue
+        output_rows.append({"Jenis output": key, "Path": path.as_posix()})
+    st.dataframe(pd.DataFrame(output_rows), use_container_width=True)
+
+    zip_bytes = zip_run_folder(run_dir)
+    st.download_button(
+        "⬇️ Download semua output sebagai ZIP",
+        data=zip_bytes,
+        file_name=f"{run_dir.name}.zip",
+        mime="application/zip",
     )
 
 
-def pad_sequences_compat(sequences, max_len: int):
-    """Pad token sequences with Keras 3 first, then tf.keras fallback."""
-    try:
-        import keras
+def render_wordcloud(text: str, title: str):
+    text = clean_for_wordcloud(text)
+    if not text:
+        st.info(f"Tidak ada teks yang cukup untuk membuat wordcloud label {title}.")
+        return
 
-        return keras.utils.pad_sequences(sequences, maxlen=max_len, padding="post", truncating="post")
-    except Exception:
-        from tensorflow.keras.preprocessing.sequence import pad_sequences
-
-        return pad_sequences(sequences, maxlen=max_len, padding="post", truncating="post")
-
-
-@st.cache_resource(show_spinner=False)
-def load_dl_artifact(artifact_dir: str):
-    artifact_path = Path(artifact_dir)
-    model_path = artifact_path / "best_dl_model.keras"
-    tokenizer_path = artifact_path / "best_dl_tokenizer.joblib"
-    metadata_path = artifact_path / "best_dl_model_metadata.json"
-
-    missing = [str(p.name) for p in [model_path, tokenizer_path] if not p.exists()]
-    if missing:
-        raise FileNotFoundError(f"Artefak DL tidak ditemukan: {', '.join(missing)} di {artifact_path}")
-
-    model = load_keras_model_compat(model_path)
-    tokenizer = joblib.load(tokenizer_path)
-    metadata = read_json(metadata_path)
-    labels = metadata.get("labels") or DEFAULT_LABELS
-    thresholds = thresholds_from_metadata(metadata, labels)
-    max_len = int(metadata.get("dl_max_len", metadata.get("max_len", 200)))
-    return model, tokenizer, metadata, labels, thresholds, max_len
-
-
-def predict_ml(texts_clean: pd.Series, artifact_dir: str) -> Tuple[np.ndarray, np.ndarray, List[str], Dict]:
-    model, metadata, labels, thresholds = load_ml_artifact(artifact_dir)
-    scores = predict_scores_or_none(model, texts_clean)
-    if scores is not None:
-        scores = normalize_scores(scores)
-        y_pred = (scores >= thresholds).astype(int)
-    else:
-        y_pred = np.asarray(model.predict(texts_clean)).astype(int)
-        scores = y_pred.astype(float)
-    return y_pred, scores, labels, metadata
-
-
-def predict_dl(texts_clean: pd.Series, artifact_dir: str) -> Tuple[np.ndarray, np.ndarray, List[str], Dict]:
-    model, tokenizer, metadata, labels, thresholds, max_len = load_dl_artifact(artifact_dir)
-    seq = tokenizer.texts_to_sequences(texts_clean.tolist())
-    padded = pad_sequences_compat(seq, max_len=max_len)
-    scores = np.asarray(model.predict(padded, verbose=0), dtype=float)
-    y_pred = (scores >= thresholds).astype(int)
-    return y_pred, scores, labels, metadata
-
-
-def add_prediction_columns(df: pd.DataFrame, y_pred: np.ndarray, scores: np.ndarray, labels: List[str]) -> pd.DataFrame:
-    out = df.copy()
-    for i, label in enumerate(labels):
-        out[f"pred_{label}"] = y_pred[:, i].astype(int)
-        out[f"score_{label}"] = np.round(scores[:, i].astype(float), 4)
-    out["predicted_labels"] = [", ".join([labels[j] for j, val in enumerate(row) if val == 1]) or "None" for row in y_pred]
-    out["n_predicted_labels"] = y_pred.sum(axis=1).astype(int)
-    return out
-
-
-def build_label_summary(y_pred: np.ndarray, labels: List[str]) -> pd.DataFrame:
-    n = len(y_pred)
-    rows = []
-    for i, label in enumerate(labels):
-        count = int(y_pred[:, i].sum())
-        rows.append({"label": label, "count": count, "percentage": round(100 * count / max(n, 1), 2)})
-    return pd.DataFrame(rows).sort_values("count", ascending=False)
-
-
-def build_combination_summary(y_pred: np.ndarray, labels: List[str]) -> pd.DataFrame:
-    combos = []
-    for row in y_pred:
-        active = [labels[i] for i, v in enumerate(row) if int(v) == 1]
-        combos.append(" + ".join(active) if active else "None")
-    summary = pd.Series(combos).value_counts().reset_index()
-    summary.columns = ["label_combination", "count"]
-    summary["percentage"] = (100 * summary["count"] / max(len(y_pred), 1)).round(2)
-    return summary
-
-
-def build_pair_summary(y_pred: np.ndarray, labels: List[str]) -> pd.DataFrame:
-    rows = []
-    for i, first in enumerate(labels):
-        for j, second in enumerate(labels):
-            if i < j:
-                count = int(np.logical_and(y_pred[:, i] == 1, y_pred[:, j] == 1).sum())
-                rows.append({"pair": f"{first} + {second}", "count": count})
-    return pd.DataFrame(rows).sort_values("count", ascending=False)
-
-
-def generate_wordcloud(texts: List[str]) -> Optional[Image.Image]:
-    text = " ".join([str(t) for t in texts if str(t).strip()])
-    if not text.strip():
-        return None
     wc = WordCloud(
         width=1000,
         height=500,
         background_color="white",
-        stopwords=STOPWORDS_ID,
         collocations=False,
-        max_words=120,
+        max_words=150,
     ).generate(text)
-    return wc.to_image()
 
-
-def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
-    return df.to_csv(index=False).encode("utf-8-sig")
-
-
-def generate_learning_insight_text(
-    n_rows: int,
-    label_summary: pd.DataFrame,
-    combo_summary: pd.DataFrame,
-    pair_summary: pd.DataFrame,
-) -> str:
-    top_label = label_summary.iloc[0]
-    top_combo = combo_summary.iloc[0]
-    problem_count = int(label_summary.loc[label_summary["label"] == "Problem", "count"].sum())
-    suggestion_count = int(label_summary.loc[label_summary["label"] == "Suggestion", "count"].sum())
-    appreciation_count = int(label_summary.loc[label_summary["label"] == "Appreciation", "count"].sum())
-    neutral_count = int(label_summary.loc[label_summary["label"] == "Neutral", "count"].sum())
-
-    # Specific pedagogical patterns
-    problem_suggestion = int(pair_summary.loc[pair_summary["pair"] == "Problem + Suggestion", "count"].sum())
-    appreciation_problem = int(pair_summary.loc[pair_summary["pair"] == "Appreciation + Problem", "count"].sum())
-
-    lines = [
-        f"Sebanyak {n_rows} peer feedback berhasil diklasifikasikan.",
-        f"Kategori yang paling dominan adalah {top_label['label']} ({int(top_label['count'])} komentar; {top_label['percentage']}%).",
-        f"Kombinasi label paling sering muncul adalah {top_combo['label_combination']} ({int(top_combo['count'])} komentar; {top_combo['percentage']}%).",
-        "",
-        "Interpretasi pembelajaran:",
-    ]
-
-    if suggestion_count > 0:
-        lines.append(
-            f"- Terdapat {suggestion_count} komentar yang mengandung Suggestion, menunjukkan adanya umpan balik yang dapat ditindaklanjuti untuk perbaikan karya."
-        )
-    if problem_count > 0:
-        lines.append(
-            f"- Terdapat {problem_count} komentar yang mengandung Problem, menunjukkan bahwa mahasiswa mampu mengidentifikasi kelemahan atau aspek yang perlu diperbaiki."
-        )
-    if appreciation_count > 0:
-        lines.append(
-            f"- Terdapat {appreciation_count} komentar yang mengandung Appreciation, mencerminkan dukungan positif dalam proses peer review."
-        )
-    if neutral_count > 0:
-        lines.append(
-            f"- Terdapat {neutral_count} komentar Neutral; proporsi ini dapat menjadi indikator komentar yang kurang evaluatif atau kurang memberikan arahan belajar."
-        )
-    if problem_suggestion > 0:
-        lines.append(
-            f"- Kombinasi Problem + Suggestion muncul pada {problem_suggestion} komentar, yang dapat dianggap sebagai feedback konstruktif karena mengidentifikasi masalah sekaligus menawarkan perbaikan."
-        )
-    if appreciation_problem > 0:
-        lines.append(
-            f"- Kombinasi Appreciation + Problem muncul pada {appreciation_problem} komentar, menunjukkan pola feedback yang menyeimbangkan penguatan positif dan kritik."
-        )
-
-    lines.append("")
-    lines.append(
-        "Secara umum, hasil ini dapat digunakan dosen untuk memantau kualitas peer review, mengidentifikasi kebutuhan scaffolding, dan mengevaluasi apakah aktivitas peer review mendorong komentar yang konstruktif."
-    )
-    return "\n".join(lines)
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.imshow(wc, interpolation="bilinear")
+    ax.axis("off")
+    ax.set_title(title)
+    st.pyplot(fig, clear_figure=True)
+    plt.close(fig)
 
 
 # -----------------------------------------------------------------------------
-# Streamlit UI
+# UI
 # -----------------------------------------------------------------------------
-st.set_page_config(
-    page_title="Peer Feedback Multi-Label Classifier",
-    page_icon="🧠",
-    layout="wide",
+st.title("🧠 Peer Feedback Multi-label Classification")
+st.caption(
+    "Aplikasi untuk mengklasifikasikan peer feedback/peer comments ke label Problem, Appreciation, Suggestion, dan Neutral."
 )
 
-st.title("🧠 Peer Feedback Multi-Label Classifier")
-st.caption("Klasifikasi komentar peer review menjadi Appreciation, Problem, Suggestion, dan Neutral, lalu mengubahnya menjadi learning insights.")
-
 with st.sidebar:
-    st.header("Pengaturan Model")
-    artifact_dir = st.text_input("Folder artefak model", value=DEFAULT_ARTIFACT_DIR)
-    model_choice = st.radio("Pilih model terbaik", options=["Machine Learning", "Deep Learning"], horizontal=False)
+    st.header("⚙️ Pengaturan")
 
-    st.divider()
-    st.header("Pengaturan Data")
-    uploaded_file = st.file_uploader("Upload CSV peer feedback", type=["csv"])
-    delimiter = st.selectbox("Delimiter CSV", options=[",", ";", "\t"], index=0)
-    encoding = st.selectbox("Encoding", options=["utf-8", "utf-8-sig", "latin-1"], index=0)
+    labels = load_labels()
+    st.write("**Label aktif:**", ", ".join(labels))
 
-    st.divider()
-    st.write("**Catatan artefak**")
-    st.code(
-        "best_ml_model.joblib\n"
-        "best_ml_model_metadata.json\n"
-        "best_dl_model.keras\n"
-        "best_dl_tokenizer.joblib\n"
-        "best_dl_model_metadata.json",
-        language="text",
+    model_choice = st.radio(
+        "Pilih model terbaik",
+        options=["Machine Learning", "Deep Learning"],
+        index=0,
     )
 
+    threshold = st.slider(
+        "Threshold klasifikasi multi-label",
+        min_value=0.05,
+        max_value=0.95,
+        value=0.50,
+        step=0.05,
+        help="Label akan aktif jika probabilitasnya sama dengan atau lebih besar dari threshold ini.",
+    )
+
+    use_neutral_rule = st.checkbox(
+        "Gunakan aturan Neutral eksklusif",
+        value=True,
+        help="Jika Problem/Appreciation/Suggestion muncul, Neutral dibuat 0. Jika tidak ada label lain, Neutral dibuat 1.",
+    )
+
+    st.divider()
+    st.subheader("Lokasi model")
+    ml_model_path = st.text_input("Path model ML (.joblib/.pkl)", "models/best_ml_model.joblib")
+    dl_model_path = st.text_input("Path model DL (.keras/.h5)", "models/best_dl_model.keras")
+    tokenizer_path = st.text_input("Path tokenizer DL (.pkl/.joblib)", "models/tokenizer.pkl")
+    max_len = st.number_input("Max sequence length DL", min_value=16, max_value=1024, value=200, step=8)
+    batch_size = st.number_input("Batch size DL", min_value=1, max_value=512, value=32, step=1)
+
+    st.divider()
+    st.subheader("Output")
+    auto_save_outputs = st.checkbox(
+        "Simpan otomatis ke folder outputs/",
+        value=True,
+        help="Jika aktif, hasil klasifikasi dan learning insights disimpan ke folder outputs/ setiap kali proses klasifikasi selesai.",
+    )
+    output_base_dir = st.text_input("Folder output", "outputs")
+
+uploaded_file = st.file_uploader("Upload file CSV berisi teks peer feedback", type=["csv"])
+
 if uploaded_file is None:
-    st.info("Upload file CSV yang berisi kolom teks peer feedback untuk mulai melakukan klasifikasi.")
+    st.info("Upload file CSV terlebih dahulu. File minimal memiliki satu kolom teks, misalnya `text`, `comment`, atau `feedback`.")
     st.stop()
 
 try:
-    df = pd.read_csv(uploaded_file, sep=delimiter, encoding=encoding)
-except Exception as exc:
-    st.error(f"CSV tidak dapat dibaca: {exc}")
+    df = pd.read_csv(uploaded_file)
+except Exception as e:
+    st.error(f"File CSV tidak dapat dibaca: {e}")
     st.stop()
 
 if df.empty:
-    st.error("File CSV kosong.")
+    st.warning("File CSV kosong.")
     st.stop()
 
-st.subheader("1. Preview Data")
+st.subheader("1. Preview data")
 st.dataframe(df.head(20), use_container_width=True)
 
-candidate_text_cols = [c for c in df.columns if df[c].dtype == "object"] or list(df.columns)
-default_text_index = 0
-for preferred in ["text", "feedback", "comment", "peer_feedback", "peer_comment", "comments"]:
-    if preferred in df.columns:
-        default_text_index = list(df.columns).index(preferred)
-        break
-
-text_col = st.selectbox(
-    "Pilih kolom teks peer feedback",
-    options=list(df.columns),
-    index=default_text_index if default_text_index < len(df.columns) else 0,
+candidate_cols = safe_columns(df)
+default_text_col = next(
+    (col for col in candidate_cols if col.lower() in ["text", "comment", "comments", "feedback", "peer_feedback", "peer_comment"]),
+    candidate_cols[0],
 )
 
-if st.button("🚀 Jalankan Klasifikasi", type="primary"):
-    artifact_path = Path(artifact_dir)
-    if not artifact_path.exists():
-        st.error(f"Folder artefak tidak ditemukan: {artifact_path}")
-        st.stop()
+text_col = st.selectbox(
+    "Pilih kolom yang berisi teks peer feedback",
+    options=candidate_cols,
+    index=candidate_cols.index(default_text_col),
+)
 
-    work_df = df.copy()
-    work_df["text_clean"] = work_df[text_col].apply(preprocess_text)
+texts = df[text_col].map(normalize_text).tolist()
+valid_mask = [bool(t) for t in texts]
+if not any(valid_mask):
+    st.error("Kolom teks yang dipilih tidak memiliki isi yang valid.")
+    st.stop()
 
-    with st.spinner("Memuat model dan melakukan klasifikasi..."):
-        try:
-            if model_choice == "Machine Learning":
-                y_pred, scores, labels, metadata = predict_ml(work_df["text_clean"], artifact_dir)
-            else:
-                y_pred, scores, labels, metadata = predict_dl(work_df["text_clean"], artifact_dir)
-        except Exception as exc:
-            st.error(f"Gagal memuat model atau melakukan prediksi: {exc}")
-            st.stop()
+if st.button("🚀 Klasifikasikan peer feedback", type="primary"):
+    progress = st.progress(0, text="Menyiapkan data...")
 
-    result_df = add_prediction_columns(work_df, y_pred, scores, labels)
-    label_summary = build_label_summary(y_pred, labels)
-    combo_summary = build_combination_summary(y_pred, labels)
-    pair_summary = build_pair_summary(y_pred, labels)
-    insight_text = generate_learning_insight_text(len(result_df), label_summary, combo_summary, pair_summary)
+    try:
+        progress.progress(15, text="Memuat model...")
+        if model_choice == "Machine Learning":
+            model = load_ml_model(ml_model_path)
+            progress.progress(40, text="Mengklasifikasikan dengan model Machine Learning...")
+            probabilities = predict_with_ml(model, texts, labels)
+            selected_model_path = ml_model_path
+        else:
+            model, tokenizer = load_dl_assets(dl_model_path, tokenizer_path)
+            progress.progress(40, text="Mengklasifikasikan dengan model Deep Learning...")
+            probabilities = predict_with_dl(model, tokenizer, texts, labels, int(max_len), int(batch_size))
+            selected_model_path = dl_model_path
 
-    st.success(f"Klasifikasi selesai menggunakan model: {model_choice}")
+        progress.progress(70, text="Mengolah hasil klasifikasi...")
+        predictions = probabilities_to_predictions(probabilities, labels, threshold, use_neutral_rule)
 
-    st.subheader("2. Ringkasan Learning Insight")
-    metric_cols = st.columns(len(labels))
-    for idx, label in enumerate(labels):
-        count = int(label_summary.loc[label_summary["label"] == label, "count"].iloc[0])
-        pct = float(label_summary.loc[label_summary["label"] == label, "percentage"].iloc[0])
-        metric_cols[idx].metric(label, f"{count}", f"{pct}%")
+        result_df = df.copy()
+        result_df[text_col] = texts
 
-    st.text_area("Summary insight otomatis", value=insight_text, height=260)
+        for i, label in enumerate(labels):
+            result_df[f"prob_{label}"] = probabilities[:, i]
+            result_df[f"pred_{label}"] = predictions[:, i]
 
-    st.subheader("3. Distribusi Label")
-    left, right = st.columns([1, 1])
-    with left:
-        st.write("**Jumlah komentar per label**")
-        st.dataframe(label_summary, use_container_width=True)
-        st.bar_chart(label_summary.set_index("label")["count"])
-    with right:
-        st.write("**Kombinasi label**")
-        st.dataframe(combo_summary, use_container_width=True)
-        st.bar_chart(combo_summary.set_index("label_combination")["count"])
+        result_df["predicted_labels"] = predictions_to_label_string(predictions, labels)
 
-    st.subheader("4. Co-occurrence Antar Label")
-    st.write("Jumlah komentar yang mendapatkan dua label sekaligus, misalnya Problem + Appreciation atau Problem + Suggestion.")
-    st.dataframe(pair_summary, use_container_width=True)
-    st.bar_chart(pair_summary.set_index("pair")["count"])
+        label_count_df, combination_df = build_insight_tables(result_df, labels)
+        summary = generate_summary(label_count_df, combination_df, len(result_df))
 
-    st.subheader("5. WordCloud per Label")
-    wc_cols = st.columns(2)
-    for i, label in enumerate(labels):
-        with wc_cols[i % 2]:
-            st.write(f"**{label}**")
-            label_texts = result_df.loc[result_df[f"pred_{label}"] == 1, "text_clean"].tolist()
-            image = generate_wordcloud(label_texts)
-            if image is None:
-                st.info(f"Tidak ada teks yang diklasifikasikan sebagai {label}.")
-            else:
-                st.image(image, use_container_width=True)
+        saved_paths = None
+        if auto_save_outputs:
+            progress.progress(90, text="Menyimpan output ke folder outputs/...")
+            metadata = {
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+                "uploaded_filename": uploaded_file.name,
+                "text_column": text_col,
+                "model_choice": model_choice,
+                "model_path": selected_model_path,
+                "threshold": float(threshold),
+                "use_neutral_rule": bool(use_neutral_rule),
+                "labels": labels,
+                "total_rows": int(len(result_df)),
+            }
+            saved_paths = save_outputs_to_folder(
+                result_df=result_df,
+                label_count_df=label_count_df,
+                combination_df=combination_df,
+                summary=summary,
+                metadata=metadata,
+                output_base_dir=Path(output_base_dir),
+            )
 
-    st.subheader("6. Hasil Klasifikasi")
+        progress.progress(100, text="Selesai.")
+
+        st.session_state["classification_result_df"] = result_df
+        st.session_state["label_count_df"] = label_count_df
+        st.session_state["combination_df"] = combination_df
+        st.session_state["summary"] = summary
+        st.session_state["saved_paths"] = saved_paths
+        st.session_state["active_labels"] = labels
+        st.session_state["active_text_col"] = text_col
+
+        st.success("Klasifikasi selesai.")
+
+    except FileNotFoundError as e:
+        st.error(
+            f"File model tidak ditemukan: {e}. Pastikan file model sudah berada di folder `models/` atau ubah path pada sidebar."
+        )
+    except Exception as e:
+        st.exception(e)
+
+if "classification_result_df" in st.session_state:
+    result_df = st.session_state["classification_result_df"]
+    label_count_df = st.session_state["label_count_df"]
+    combination_df = st.session_state["combination_df"]
+    summary = st.session_state["summary"]
+    saved_paths = st.session_state.get("saved_paths")
+    labels = st.session_state.get("active_labels", labels)
+    text_col = st.session_state.get("active_text_col", text_col)
+
+    st.subheader("2. Hasil klasifikasi")
     st.dataframe(result_df, use_container_width=True)
 
+    csv_bytes = result_df.to_csv(index=False).encode("utf-8-sig")
     st.download_button(
-        label="⬇️ Download hasil klasifikasi CSV",
-        data=dataframe_to_csv_bytes(result_df),
+        "⬇️ Download hasil klasifikasi CSV",
+        data=csv_bytes,
         file_name="peer_feedback_classification_results.csv",
         mime="text/csv",
     )
 
-    st.download_button(
-        label="⬇️ Download ringkasan label CSV",
-        data=dataframe_to_csv_bytes(label_summary),
-        file_name="peer_feedback_label_summary.csv",
-        mime="text/csv",
-    )
+    st.subheader("3. Learning insight: distribusi label")
+    metric_cols = st.columns(len(labels))
+    for idx, label in enumerate(labels):
+        row = label_count_df[label_count_df["Label"] == label].iloc[0]
+        metric_cols[idx].metric(label, int(row["Count"]), f"{row['Percentage']}%")
+
+    left, right = st.columns(2)
+    with left:
+        st.write("**Jumlah feedback per label**")
+        st.dataframe(label_count_df, use_container_width=True)
+        st.bar_chart(label_count_df.set_index("Label")["Count"])
+
+    with right:
+        st.write("**Kombinasi label**")
+        st.dataframe(combination_df, use_container_width=True)
+        if not combination_df.empty:
+            st.bar_chart(combination_df.set_index("Label combination")["Count"])
+
+    st.subheader("4. Wordcloud per label")
+    tabs = st.tabs(labels)
+    for tab, label in zip(tabs, labels):
+        with tab:
+            label_texts = result_df.loc[result_df[f"pred_{label}"] == 1, text_col].tolist()
+            render_wordcloud(" ".join(label_texts), label)
+
+    st.subheader("5. Summary learning insight")
+    st.write(summary)
 
     st.download_button(
-        label="⬇️ Download kombinasi label CSV",
-        data=dataframe_to_csv_bytes(combo_summary),
-        file_name="peer_feedback_label_combination_summary.csv",
-        mime="text/csv",
+        "⬇️ Download summary learning insight TXT",
+        data=summary.encode("utf-8"),
+        file_name="summary_learning_insight.txt",
+        mime="text/plain",
     )
 
-    st.subheader("7. Metadata Model")
-    st.json(metadata)
+    st.subheader("6. Contoh feedback per label")
+    for label in labels:
+        with st.expander(f"Contoh feedback: {label}"):
+            sample_df = result_df.loc[result_df[f"pred_{label}"] == 1, [text_col, "predicted_labels"]].head(10)
+            if sample_df.empty:
+                st.info(f"Tidak ada feedback yang diklasifikasikan sebagai {label}.")
+            else:
+                st.dataframe(sample_df, use_container_width=True)
+
+    if saved_paths:
+        render_saved_output_section(saved_paths)
+    else:
+        st.subheader("7. Penyimpanan output")
+        st.info("Output belum disimpan ke folder. Aktifkan opsi `Simpan otomatis ke folder outputs/` pada sidebar, lalu jalankan klasifikasi kembali.")

@@ -1,0 +1,47 @@
+{
+  "family": "ML",
+  "best_model_name": "BR_RandomForest",
+  "candidate_models": [
+    "BR_LogisticRegression",
+    "BR_CalibratedSGD",
+    "BR_CalibratedLinearSVC",
+    "BR_RandomForest",
+    "BR_ExtraTrees",
+    "BR_AdaBoost",
+    "ClassifierChain_LogisticRegression",
+    "ClassifierChain_CalibratedSGD",
+    "ClassifierChain_CalibratedLinearSVC",
+    "ClassifierChain_RandomForest",
+    "ClassifierChain_ExtraTrees",
+    "ClassifierChain_AdaBoost",
+    "LabelPowerset_LogisticRegression",
+    "LabelPowerset_CalibratedSGD",
+    "LabelPowerset_CalibratedLinearSVC",
+    "LabelPowerset_RandomForest",
+    "LabelPowerset_ExtraTrees",
+    "LabelPowerset_AdaBoost"
+  ],
+  "selection_metric": "cross_validation val_micro_f1_mean",
+  "selection_source": "training_set_cross_validation",
+  "validation_micro_f1": 0.8471177944862155,
+  "test_metrics": {
+    "subset_accuracy_exact_match": 0.503448275862069,
+    "hamming_loss": 0.16206896551724137,
+    "micro_f1": 0.8097165991902834,
+    "macro_f1": 0.7380176635122933,
+    "weighted_f1": 0.8220743870804913,
+    "samples_f1": 0.8116256157635467,
+    "jaccard_micro": 0.6802721088435374,
+    "jaccard_samples": 0.743103448275862
+  },
+  "thresholds": {
+    "Appreciation": 0.75,
+    "Problem": 0.4,
+    "Suggestion": 0.25,
+    "Neutral": 0.25
+  },
+  "model_file": "best_ml_model.joblib",
+  "reports_dir": "best_ml_model_reports",
+  "cv_summary_path": "/home/jupyter-sigitpurnomo/research/peer-review/baru/artifacts/multilabel_run_20260605_084525/cross_validation/ml/ml_cv_summary_metrics.csv",
+  "test_usage": "Test set was evaluated once only for the selected best ML model."
+}

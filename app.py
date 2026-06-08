@@ -1,5 +1,5 @@
 """
-Streamlit app for multi-label peer feedback classification.
+Streamlit app for multi-label peer feedback classification and learning insight generation.
 
 Expected artifact structure inside ARTIFACT_DIR:
 - best_ml_model.joblib
@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import json
 import re
-from io import BytesIO
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -28,14 +27,13 @@ import streamlit as st
 from PIL import Image
 from sklearn.base import BaseEstimator, ClassifierMixin, clone
 from sklearn.calibration import CalibratedClassifierCV
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import classification_report, multilabel_confusion_matrix
-from sklearn.preprocessing import LabelEncoder
+from sklearn.decomposition import NMF
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import LabelEncoder
 from wordcloud import WordCloud
 
-# TensorFlow is imported lazily only when DL is used.
-
+# TensorFlow / Keras / Transformers are imported lazily only when needed.
 
 # -----------------------------------------------------------------------------
 # Custom classes needed for joblib compatibility
@@ -117,8 +115,23 @@ STOPWORDS_ID = {
     "adalah", "atau", "juga", "karena", "sebagai", "lebih", "agar", "akan", "sudah", "belum",
     "tidak", "bisa", "dapat", "sangat", "masih", "ada", "jadi", "tersebut", "nya", "the",
     "a", "an", "and", "or", "to", "of", "in", "is", "are", "for", "with", "on", "this",
+    "saya", "kami", "kita", "mereka", "mahasiswa", "komentar", "feedback", "peer", "review",
+    "menurut", "menjadi", "sehingga", "secara", "namun", "tetapi", "cukup", "perlu",
 }
 
+LABEL_PEDAGOGICAL_MEANING = {
+    "Appreciation": "menunjukkan aspek yang dinilai positif, kuat, jelas, menarik, atau sudah baik oleh mahasiswa.",
+    "Problem": "menunjukkan aspek yang dianggap masih bermasalah, kurang jelas, kurang lengkap, keliru, atau perlu diperbaiki.",
+    "Suggestion": "menunjukkan rekomendasi, arahan perbaikan, atau masukan yang dapat ditindaklanjuti.",
+    "Neutral": "menunjukkan komentar yang cenderung deskriptif, umum, atau belum memberikan evaluasi dan arahan perbaikan yang kuat.",
+}
+
+LABEL_TEACHER_ACTION = {
+    "Appreciation": "Gunakan informasi ini untuk mengidentifikasi aspek karya yang sudah dipahami atau diapresiasi mahasiswa, lalu dorong mereka menjelaskan alasan apresiasinya secara lebih spesifik.",
+    "Problem": "Gunakan informasi ini untuk melihat bagian yang paling sering dipermasalahkan dan jadikan sebagai dasar klarifikasi, remediasi, atau diskusi kelas.",
+    "Suggestion": "Gunakan informasi ini untuk menilai apakah mahasiswa sudah mampu memberi masukan yang konkret, operasional, dan dapat ditindaklanjuti.",
+    "Neutral": "Gunakan informasi ini sebagai sinyal perlunya rubrik, contoh komentar, atau scaffolding agar mahasiswa menghasilkan feedback yang lebih evaluatif.",
+}
 
 # -----------------------------------------------------------------------------
 # Utility functions
@@ -155,7 +168,6 @@ def thresholds_from_metadata(metadata: Dict, labels: List[str]) -> np.ndarray:
 
 
 def normalize_scores(scores: np.ndarray) -> np.ndarray:
-    """Map decision scores to [0,1] with sigmoid when needed."""
     scores = np.asarray(scores, dtype=float)
     if scores.ndim == 1:
         scores = scores.reshape(-1, 1)
@@ -168,7 +180,6 @@ def predict_scores_or_none(model, texts: pd.Series) -> Optional[np.ndarray]:
     if hasattr(model, "predict_proba"):
         proba = model.predict_proba(texts)
         if isinstance(proba, list):
-            # MultiOutputClassifier returns a list of arrays, one per label.
             return np.vstack([p[:, 1] if p.ndim == 2 and p.shape[1] > 1 else p.ravel() for p in proba]).T
         proba = np.asarray(proba)
         if proba.ndim == 3:
@@ -196,16 +207,21 @@ def load_ml_artifact(artifact_dir: str) -> Tuple[object, Dict, List[str], np.nda
 
     if len(thresholds) != len(labels):
         thresholds = thresholds_from_metadata(metadata, labels)
-
     return model, metadata, labels, thresholds
 
 
 @st.cache_resource(show_spinner=False)
 def load_dl_artifact(artifact_dir: str):
-    from tensorflow.keras.models import load_model
-
     artifact_path = Path(artifact_dir)
-    model = load_model(artifact_path / "best_dl_model.keras")
+    model_path = artifact_path / "best_dl_model.keras"
+
+    try:
+        import keras
+        model = keras.saving.load_model(model_path, compile=False, safe_mode=False)
+    except Exception:
+        from tensorflow.keras.models import load_model
+        model = load_model(model_path, compile=False)
+
     tokenizer = joblib.load(artifact_path / "best_dl_tokenizer.joblib")
     metadata = read_json(artifact_path / "best_dl_model_metadata.json")
     labels = metadata.get("labels") or DEFAULT_LABELS
@@ -227,7 +243,10 @@ def predict_ml(texts_clean: pd.Series, artifact_dir: str) -> Tuple[np.ndarray, n
 
 
 def predict_dl(texts_clean: pd.Series, artifact_dir: str) -> Tuple[np.ndarray, np.ndarray, List[str], Dict]:
-    from tensorflow.keras.preprocessing.sequence import pad_sequences
+    try:
+        from keras.utils import pad_sequences
+    except Exception:
+        from tensorflow.keras.preprocessing.sequence import pad_sequences
 
     model, tokenizer, metadata, labels, thresholds, max_len = load_dl_artifact(artifact_dir)
     seq = tokenizer.texts_to_sequences(texts_clean.tolist())
@@ -269,99 +288,12 @@ def build_combination_summary(y_pred: np.ndarray, labels: List[str]) -> pd.DataF
 
 def build_pair_summary(y_pred: np.ndarray, labels: List[str]) -> pd.DataFrame:
     rows = []
-    n = len(y_pred)
     for i, first in enumerate(labels):
         for j, second in enumerate(labels):
             if i < j:
                 count = int(np.logical_and(y_pred[:, i] == 1, y_pred[:, j] == 1).sum())
-                rows.append({
-                    "pair": f"{first} + {second}",
-                    "count": count,
-                    "percentage": round(100 * count / max(n, 1), 2),
-                })
+                rows.append({"pair": f"{first} + {second}", "count": count})
     return pd.DataFrame(rows).sort_values("count", ascending=False)
-
-
-def pct(value: float) -> str:
-    return f"{float(value):.2f}%"
-
-
-def extract_keyphrases(texts: List[str], top_n: int = 8) -> List[str]:
-    """Extract readable unigram/bigram keyphrases using TF-IDF."""
-    cleaned = [str(t).strip() for t in texts if str(t).strip()]
-    if not cleaned:
-        return []
-    try:
-        vectorizer = TfidfVectorizer(
-            ngram_range=(1, 2),
-            min_df=1,
-            max_df=0.95,
-            stop_words=list(STOPWORDS_ID),
-            token_pattern=r"(?u)\b[a-zA-ZÀ-ÿ][a-zA-ZÀ-ÿ0-9_\-]{2,}\b",
-            max_features=4000,
-        )
-        X = vectorizer.fit_transform(cleaned)
-        scores = np.asarray(X.sum(axis=0)).ravel()
-        terms = np.asarray(vectorizer.get_feature_names_out())
-        order = scores.argsort()[::-1]
-        phrases = []
-        seen = set()
-        for idx in order:
-            term = str(terms[idx]).strip()
-            # Prefer clearer terms and avoid near-duplicate unigram/bigram repetitions.
-            if not term or term in seen:
-                continue
-            if len(term) < 3:
-                continue
-            phrases.append(term)
-            seen.add(term)
-            if len(phrases) >= top_n:
-                break
-        return phrases
-    except Exception:
-        # Safe fallback if the texts are too short or vectorization fails.
-        tokens = []
-        for text in cleaned:
-            tokens.extend([tok for tok in re.findall(r"[a-zA-ZÀ-ÿ]{3,}", text.lower()) if tok not in STOPWORDS_ID])
-        if not tokens:
-            return []
-        return pd.Series(tokens).value_counts().head(top_n).index.tolist()
-
-
-def build_label_topic_summary(result_df: pd.DataFrame, labels: List[str]) -> Dict[str, Dict]:
-    """Create compact per-label topic summaries for the learning insight text."""
-    n = len(result_df)
-    summary = {}
-    for label in labels:
-        mask = result_df[f"pred_{label}"] == 1
-        label_texts = result_df.loc[mask, "text_clean"].tolist()
-        count = int(mask.sum())
-        summary[label] = {
-            "count": count,
-            "percentage": round(100 * count / max(n, 1), 2),
-            "keyphrases": extract_keyphrases(label_texts, top_n=6),
-        }
-    return summary
-
-
-def label_meaning(label: str) -> str:
-    meanings = {
-        "Appreciation": "menggambarkan aspek yang dinilai positif, jelas, menarik, atau sudah baik oleh mahasiswa",
-        "Problem": "menunjukkan aspek yang dianggap kurang, membingungkan, bermasalah, atau perlu diperbaiki",
-        "Suggestion": "menunjukkan rekomendasi perbaikan, tindakan lanjutan, atau masukan konkret",
-        "Neutral": "menunjukkan komentar yang cenderung deskriptif, umum, atau belum cukup evaluatif",
-    }
-    return meanings.get(label, "menggambarkan pola komentar yang terdeteksi pada label ini")
-
-
-def label_instructional_action(label: str) -> str:
-    actions = {
-        "Appreciation": "Gunakan aspek ini sebagai contoh praktik baik atau kekuatan karya yang perlu dipertahankan.",
-        "Problem": "Gunakan aspek ini untuk mengidentifikasi bagian materi/karya yang perlu klarifikasi, revisi, atau pendampingan.",
-        "Suggestion": "Gunakan masukan ini sebagai dasar tindak lanjut karena biasanya berisi arahan perbaikan yang dapat diterapkan.",
-        "Neutral": "Berikan rubrik, contoh komentar, atau prompt tambahan agar mahasiswa menulis feedback yang lebih spesifik dan bermanfaat.",
-    }
-    return actions.get(label, "Gunakan temuan ini sebagai bahan refleksi pembelajaran.")
 
 
 def generate_wordcloud(texts: List[str]) -> Optional[Image.Image]:
@@ -373,8 +305,8 @@ def generate_wordcloud(texts: List[str]) -> Optional[Image.Image]:
         height=500,
         background_color="white",
         stopwords=STOPWORDS_ID,
-        collocations=False,
-        max_words=120,
+        collocations=True,
+        max_words=140,
     ).generate(text)
     return wc.to_image()
 
@@ -383,124 +315,206 @@ def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8-sig")
 
 
-def generate_learning_insight_text(
-    n_rows: int,
+def make_vectorizer(max_features: int = 1200, ngram_range: Tuple[int, int] = (1, 3)) -> TfidfVectorizer:
+    return TfidfVectorizer(
+        stop_words=list(STOPWORDS_ID),
+        ngram_range=ngram_range,
+        min_df=1,
+        max_df=0.95,
+        max_features=max_features,
+        token_pattern=r"(?u)\b[a-zA-ZÀ-ÿ][a-zA-ZÀ-ÿ0-9_\-]{2,}\b",
+        sublinear_tf=True,
+    )
+
+
+def extract_keyphrases(texts: List[str], top_n: int = 12, prefer_phrases: bool = True) -> List[Tuple[str, float]]:
+    valid_texts = [str(t).strip() for t in texts if str(t).strip()]
+    if not valid_texts:
+        return []
+    try:
+        vectorizer = make_vectorizer(max_features=2500, ngram_range=(1, 3))
+        X = vectorizer.fit_transform(valid_texts)
+        scores = np.asarray(X.mean(axis=0)).ravel()
+        terms = np.array(vectorizer.get_feature_names_out())
+        ranking = pd.DataFrame({"keyphrase": terms, "score": scores})
+        ranking["n_words"] = ranking["keyphrase"].str.split().str.len()
+        ranking = ranking[ranking["score"] > 0]
+        if prefer_phrases:
+            multi = ranking[ranking["n_words"] >= 2].sort_values(["score", "n_words"], ascending=[False, False])
+            uni = ranking[ranking["n_words"] == 1].sort_values("score", ascending=False)
+            combined = pd.concat([multi, uni], ignore_index=True)
+        else:
+            combined = ranking.sort_values(["score", "n_words"], ascending=[False, False])
+        combined = combined.drop_duplicates("keyphrase").head(top_n)
+        return list(zip(combined["keyphrase"].tolist(), combined["score"].round(5).tolist()))
+    except Exception:
+        return []
+
+
+def keyphrase_dataframe_by_label(result_df: pd.DataFrame, labels: List[str], text_col: str, top_n: int = 15) -> pd.DataFrame:
+    rows = []
+    for label in labels:
+        texts = result_df.loc[result_df[f"pred_{label}"] == 1, text_col].tolist()
+        for rank, (phrase, score) in enumerate(extract_keyphrases(texts, top_n=top_n, prefer_phrases=True), start=1):
+            rows.append({"label": label, "rank": rank, "keyphrase": phrase, "score": score, "n_words": len(phrase.split())})
+    return pd.DataFrame(rows)
+
+
+def representative_comments(result_df: pd.DataFrame, label: str, original_text_col: str, top_n: int = 5) -> pd.DataFrame:
+    subset = result_df.loc[result_df[f"pred_{label}"] == 1].copy()
+    if subset.empty:
+        return pd.DataFrame(columns=[original_text_col, f"score_{label}", "predicted_labels"])
+    subset = subset.sort_values(f"score_{label}", ascending=False)
+    cols = [original_text_col, f"score_{label}", "predicted_labels"]
+    existing = [c for c in cols if c in subset.columns]
+    return subset[existing].head(top_n)
+
+
+def fallback_abstractive_summary(label: str, n_label: int, n_total: int, keyphrases: List[Tuple[str, float]], combo_summary: pd.DataFrame) -> str:
+    pct = 100 * n_label / max(n_total, 1)
+    phrase_text = ", ".join([p for p, _ in keyphrases[:6]]) if keyphrases else "belum ada tema dominan yang cukup kuat"
+    meaning = LABEL_PEDAGOGICAL_MEANING.get(label, "merepresentasikan pola komentar tertentu.")
+    action = LABEL_TEACHER_ACTION.get(label, "Gunakan informasi ini untuk mendukung analisis pembelajaran.")
+    related_combos = combo_summary[combo_summary["label_combination"].str.contains(label, regex=False, na=False)].head(3)
+    combo_text = "; ".join(
+        [f"{r.label_combination} ({int(r['count'])} komentar)" for _, r in related_combos.iterrows()]
+    ) or "tidak ada kombinasi label dominan"
+
+    return (
+        f"Pada label {label}, terdapat {n_label} dari {n_total} komentar ({pct:.2f}%). "
+        f"Tema utama yang muncul berkaitan dengan {phrase_text}. Secara pedagogis, label ini {meaning} "
+        f"Pola kombinasi yang relevan adalah {combo_text}. {action}"
+    )
+
+
+@st.cache_resource(show_spinner=False)
+def load_summarizer_pipeline(model_name: str):
+    from transformers import pipeline
+    return pipeline("summarization", model=model_name, tokenizer=model_name)
+
+
+def transformer_summary(texts: List[str], model_name: str, max_chars: int = 3500) -> Optional[str]:
+    joined = " ".join([str(t).strip() for t in texts if str(t).strip()])[:max_chars]
+    if len(joined.split()) < 20:
+        return None
+    try:
+        summarizer = load_summarizer_pipeline(model_name)
+        out = summarizer(joined, max_length=160, min_length=35, do_sample=False)
+        return out[0].get("summary_text", "").strip() or None
+    except Exception:
+        return None
+
+
+def label_summary_markdown(
+    result_df: pd.DataFrame,
+    labels: List[str],
     label_summary: pd.DataFrame,
     combo_summary: pd.DataFrame,
     pair_summary: pd.DataFrame,
-    label_topics: Optional[Dict[str, Dict]] = None,
+    keyphrase_df: pd.DataFrame,
 ) -> str:
-    """Generate a readable, teacher-oriented learning insight summary in Markdown."""
-    label_topics = label_topics or {}
+    n_rows = len(result_df)
     top_label = label_summary.iloc[0]
     top_combo = combo_summary.iloc[0]
 
-    def label_count(label: str) -> int:
-        value = label_summary.loc[label_summary["label"] == label, "count"]
-        return int(value.iloc[0]) if len(value) else 0
+    lines = [
+        "### Ringkasan Eksekutif",
+        f"Sebanyak **{n_rows} peer feedback** berhasil diklasifikasikan. Karena ini adalah **multi-label classification**, satu komentar dapat memiliki lebih dari satu label sehingga total persentase antarlabel dapat melebihi 100%.",
+        f"Kategori paling dominan adalah **{top_label['label']}** dengan **{int(top_label['count'])} komentar ({float(top_label['percentage']):.2f}%)**.",
+        f"Kombinasi label yang paling sering muncul adalah **{top_combo['label_combination']}** dengan **{int(top_combo['count'])} komentar ({float(top_combo['percentage']):.2f}%)**.",
+        "",
+        "### Profil Feedback per Label",
+    ]
 
-    def label_pct(label: str) -> float:
-        value = label_summary.loc[label_summary["label"] == label, "percentage"]
-        return float(value.iloc[0]) if len(value) else 0.0
+    for label in labels:
+        row = label_summary[label_summary["label"] == label].iloc[0]
+        kps = keyphrase_df[keyphrase_df["label"] == label]["keyphrase"].head(7).tolist()
+        kp_text = ", ".join(kps) if kps else "belum tersedia"
+        lines.extend([
+            f"**{label}** — {int(row['count'])} komentar ({float(row['percentage']):.2f}%).",
+            f"Tema/kata kunci utama: {kp_text}.",
+            f"Makna pedagogis: label ini {LABEL_PEDAGOGICAL_MEANING.get(label, '')}",
+            f"Tindak lanjut pengajar: {LABEL_TEACHER_ACTION.get(label, '')}",
+            "",
+        ])
 
-    def pair_count(pair: str) -> int:
-        value = pair_summary.loc[pair_summary["pair"] == pair, "count"]
-        return int(value.iloc[0]) if len(value) else 0
-
-    def pair_pct(pair: str) -> float:
-        value = pair_summary.loc[pair_summary["pair"] == pair, "percentage"]
-        return float(value.iloc[0]) if len(value) else 0.0
-
-    appreciation_count = label_count("Appreciation")
-    problem_count = label_count("Problem")
-    suggestion_count = label_count("Suggestion")
-    neutral_count = label_count("Neutral")
-    problem_suggestion = pair_count("Problem + Suggestion")
-    appreciation_problem = pair_count("Appreciation + Problem")
-
-    suggestion_gap = max(problem_count - problem_suggestion, 0)
-
-    lines = []
-    lines.append("### Ringkasan Eksekutif")
-    lines.append(
-        f"Sebanyak **{n_rows} peer feedback** berhasil diklasifikasikan. "
-        f"Kategori paling dominan adalah **{top_label['label']}** "
-        f"(**{int(top_label['count'])} komentar; {pct(top_label['percentage'])}**). "
-        f"Kombinasi label yang paling sering muncul adalah **{top_combo['label_combination']}** "
-        f"(**{int(top_combo['count'])} komentar; {pct(top_combo['percentage'])}**)."
-    )
-    lines.append(
-        "Karena klasifikasi bersifat **multi-label**, satu komentar dapat masuk ke lebih dari satu kategori. "
-        "Oleh karena itu, total persentase antarlabel dapat melebihi 100%."
-    )
-
-    lines.append("\n### Profil Feedback per Label")
-    for label in ["Appreciation", "Problem", "Suggestion", "Neutral"]:
-        if label not in label_summary["label"].tolist():
-            continue
-        topics = label_topics.get(label, {}).get("keyphrases", [])
-        topics_text = ", ".join(topics[:6]) if topics else "belum ada topik dominan yang cukup kuat"
-        count = label_count(label)
-        percentage = label_pct(label)
-        lines.append(
-            f"**{label}** — **{count} komentar ({pct(percentage)})**. "
-            f"Tema/kata kunci utama: *{topics_text}*. "
-            f"Label ini {label_meaning(label)}. {label_instructional_action(label)}"
-        )
-
-    lines.append("\n### Pola Kombinasi Label yang Perlu Diperhatikan")
-    if problem_suggestion > 0:
-        lines.append(
-            f"- **Problem + Suggestion** muncul pada **{problem_suggestion} komentar ({pct(pair_pct('Problem + Suggestion'))})**. "
-            "Ini merupakan indikator feedback konstruktif karena mahasiswa tidak hanya menemukan masalah, tetapi juga memberikan arah perbaikan."
-        )
+    lines.append("### Pola Kombinasi Label yang Perlu Diperhatikan")
+    if not pair_summary.empty:
+        for _, r in pair_summary[pair_summary["count"] > 0].head(6).iterrows():
+            pair = r["pair"]
+            count = int(r["count"])
+            if pair == "Problem + Suggestion":
+                interpretation = "menunjukkan feedback konstruktif karena mahasiswa menemukan masalah sekaligus memberi arah perbaikan."
+            elif pair == "Appreciation + Problem":
+                interpretation = "menunjukkan feedback yang relatif seimbang antara penguatan positif dan kritik."
+            elif pair == "Appreciation + Suggestion":
+                interpretation = "menunjukkan apresiasi yang disertai masukan perbaikan."
+            else:
+                interpretation = "menunjukkan adanya lebih dari satu fungsi feedback dalam komentar yang sama."
+            lines.append(f"- **{pair}**: {count} komentar; {interpretation}")
     else:
-        lines.append(
-            "- **Problem + Suggestion** belum muncul secara kuat. Ini menunjukkan bahwa kritik mahasiswa belum banyak disertai rekomendasi perbaikan yang eksplisit."
-        )
+        lines.append("- Belum ada pola kombinasi label yang dapat dihitung.")
 
-    if appreciation_problem > 0:
-        lines.append(
-            f"- **Appreciation + Problem** muncul pada **{appreciation_problem} komentar ({pct(pair_pct('Appreciation + Problem'))})**. "
-            "Pola ini menunjukkan feedback yang relatif seimbang karena mahasiswa mengakui aspek positif sekaligus menunjukkan bagian yang perlu diperbaiki."
-        )
-
-    if problem_count > 0 and suggestion_gap > 0:
-        lines.append(
-            f"- Terdapat sekitar **{suggestion_gap} komentar Problem** yang tidak terhubung dengan Suggestion. "
-            "Pengajar dapat mendorong mahasiswa agar setiap kritik dilengkapi dengan saran yang spesifik dan dapat ditindaklanjuti."
-        )
-
-    if suggestion_count < max(1, int(0.1 * n_rows)):
-        lines.append(
-            f"- Proporsi **Suggestion** masih rendah (**{suggestion_count} komentar; {pct(label_pct('Suggestion'))}**). "
-            "Ini mengindikasikan perlunya scaffolding, misalnya template kalimat: 'Bagian yang dapat diperbaiki adalah ... karena ... saran saya ...'."
-        )
-
+    neutral_count = int(label_summary.loc[label_summary["label"] == "Neutral", "count"].sum())
+    suggestion_count = int(label_summary.loc[label_summary["label"] == "Suggestion", "count"].sum())
+    appreciation_count = int(label_summary.loc[label_summary["label"] == "Appreciation", "count"].sum())
+    lines.extend(["", "### Implikasi untuk Pengajar"])
+    if appreciation_count > suggestion_count:
+        lines.append("- Apresiasi lebih dominan daripada saran. Pengajar dapat mendorong mahasiswa melengkapi pujian dengan alasan spesifik dan rekomendasi yang dapat ditindaklanjuti.")
     if neutral_count / max(n_rows, 1) >= 0.20:
-        lines.append(
-            f"- **Neutral** cukup tinggi (**{neutral_count} komentar; {pct(label_pct('Neutral'))}**). "
-            "Pengajar dapat memberi contoh komentar yang evaluatif agar mahasiswa tidak hanya menulis komentar umum atau deskriptif."
-        )
+        lines.append("- Proporsi Neutral cukup tinggi. Pertimbangkan pemberian contoh komentar, sentence starter, atau rubrik agar feedback lebih evaluatif dan informatif.")
+    lines.append("- Gunakan tema/kata kunci per label untuk mengidentifikasi aspek materi, produk, atau kinerja yang paling sering diapresiasi, dikritik, atau disarankan untuk diperbaiki.")
+    return "\n".join(lines)
 
-    lines.append("\n### Implikasi untuk Pengajar")
-    lines.append(
-        "Hasil ini dapat digunakan untuk memantau kualitas peer review pada level kelas. "
-        "Jika Appreciation dominan, aktivitas peer review sudah menunjukkan dukungan sosial, tetapi pengajar tetap perlu mendorong komentar yang lebih analitis. "
-        "Jika Problem muncul tanpa Suggestion, mahasiswa perlu diarahkan untuk memberikan solusi. "
-        "Jika Neutral tinggi, rubrik dan contoh feedback perlu diperjelas agar komentar lebih spesifik, evaluatif, dan bermanfaat bagi perbaikan karya."
+
+def run_topic_modeling(texts: List[str], labels_for_docs: List[str], n_topics: int = 5, top_terms: int = 10):
+    valid = pd.DataFrame({"text": texts, "predicted_labels": labels_for_docs})
+    valid["text"] = valid["text"].fillna("").astype(str)
+    valid = valid[valid["text"].str.strip() != ""].reset_index(drop=True)
+    if len(valid) < 2:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    n_topics = max(1, min(int(n_topics), len(valid), 10))
+    vectorizer = make_vectorizer(max_features=2000, ngram_range=(1, 3))
+    X = vectorizer.fit_transform(valid["text"].tolist())
+    if X.shape[1] < 2:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    model = NMF(n_components=n_topics, init="nndsvda", random_state=42, max_iter=600)
+    W = model.fit_transform(X)
+    H = model.components_
+    terms = np.array(vectorizer.get_feature_names_out())
+
+    topic_rows = []
+    for topic_idx, comp in enumerate(H):
+        top_idx = comp.argsort()[::-1][:top_terms]
+        topic_terms = terms[top_idx].tolist()
+        topic_rows.append({
+            "topic_id": int(topic_idx + 1),
+            "top_keyphrases": ", ".join(topic_terms),
+            "topic_label": " / ".join(topic_terms[:3]),
+        })
+    topics_df = pd.DataFrame(topic_rows)
+
+    dominant = W.argmax(axis=1) + 1
+    confidence = W.max(axis=1) / np.maximum(W.sum(axis=1), 1e-12)
+    doc_topics = valid.copy()
+    doc_topics["topic_id"] = dominant.astype(int)
+    doc_topics["topic_confidence"] = np.round(confidence, 4)
+    doc_topics = doc_topics.merge(topics_df, on="topic_id", how="left")
+
+    topic_distribution = (
+        doc_topics.groupby(["topic_id", "topic_label"], as_index=False)
+        .agg(count=("text", "size"), dominant_predicted_labels=("predicted_labels", lambda x: x.value_counts().index[0]))
+        .sort_values("count", ascending=False)
     )
-    return "\n\n".join(lines)
-
+    topic_distribution["percentage"] = (100 * topic_distribution["count"] / len(doc_topics)).round(2)
+    return topics_df, topic_distribution, doc_topics
 
 # -----------------------------------------------------------------------------
 # Streamlit UI
 # -----------------------------------------------------------------------------
-st.set_page_config(
-    page_title="Peer Feedback Multi-Label Classifier",
-    page_icon="🧠",
-    layout="wide",
-)
+st.set_page_config(page_title="Peer Feedback Multi-Label Classifier", page_icon="🧠", layout="wide")
 
 st.title("🧠 Peer Feedback Multi-Label Classifier")
 st.caption("Klasifikasi komentar peer review menjadi Appreciation, Problem, Suggestion, dan Neutral, lalu mengubahnya menjadi learning insights.")
@@ -509,6 +523,13 @@ with st.sidebar:
     st.header("Pengaturan Model")
     artifact_dir = st.text_input("Folder artefak model", value=DEFAULT_ARTIFACT_DIR)
     model_choice = st.radio("Pilih model terbaik", options=["Machine Learning", "Deep Learning"], horizontal=False)
+
+    st.divider()
+    st.header("Pengaturan Analisis")
+    top_n_keyphrases = st.slider("Jumlah keyphrase per label", 5, 30, 15)
+    n_topics = st.slider("Jumlah topik global NMF", 2, 10, 5)
+    use_transformer_summary = st.checkbox("Gunakan Transformer abstractive summarization jika tersedia", value=False)
+    summarizer_model = st.text_input("Model summarization", value="cahya/t5-base-indonesian-summarization-cased")
 
     st.divider()
     st.header("Pengaturan Data")
@@ -580,9 +601,14 @@ if st.button("🚀 Jalankan Klasifikasi", type="primary"):
     label_summary = build_label_summary(y_pred, labels)
     combo_summary = build_combination_summary(y_pred, labels)
     pair_summary = build_pair_summary(y_pred, labels)
-    label_topics = build_label_topic_summary(result_df, labels)
-    insight_text = generate_learning_insight_text(
-        len(result_df), label_summary, combo_summary, pair_summary, label_topics
+    keyphrase_df = keyphrase_dataframe_by_label(result_df, labels, "text_clean", top_n=top_n_keyphrases)
+    readable_summary = label_summary_markdown(result_df, labels, label_summary, combo_summary, pair_summary, keyphrase_df)
+
+    topics_df, topic_distribution, doc_topics = run_topic_modeling(
+        result_df["text_clean"].tolist(),
+        result_df["predicted_labels"].tolist(),
+        n_topics=n_topics,
+        top_terms=12,
     )
 
     st.success(f"Klasifikasi selesai menggunakan model: {model_choice}")
@@ -593,12 +619,9 @@ if st.button("🚀 Jalankan Klasifikasi", type="primary"):
         count = int(label_summary.loc[label_summary["label"] == label, "count"].iloc[0])
         pct = float(label_summary.loc[label_summary["label"] == label, "percentage"].iloc[0])
         metric_cols[idx].metric(label, f"{count}", f"{pct}%")
+    st.markdown(readable_summary)
 
-    st.markdown(insight_text)
-    with st.expander("Lihat/copy versi Markdown ringkasan"):
-        st.text_area("Summary insight otomatis", value=insight_text, height=420)
-
-    st.subheader("3. Distribusi Label")
+    st.subheader("3. Distribusi dan Kombinasi Label")
     left, right = st.columns([1, 1])
     with left:
         st.write("**Jumlah komentar per label**")
@@ -614,19 +637,103 @@ if st.button("🚀 Jalankan Klasifikasi", type="primary"):
     st.dataframe(pair_summary, use_container_width=True)
     st.bar_chart(pair_summary.set_index("pair")["count"])
 
-    st.subheader("5. WordCloud per Label")
-    wc_cols = st.columns(2)
-    for i, label in enumerate(labels):
-        with wc_cols[i % 2]:
-            st.write(f"**{label}**")
-            label_texts = result_df.loc[result_df[f"pred_{label}"] == 1, "text_clean"].tolist()
-            image = generate_wordcloud(label_texts)
-            if image is None:
-                st.info(f"Tidak ada teks yang diklasifikasikan sebagai {label}.")
-            else:
-                st.image(image, use_container_width=True)
+    st.subheader("5. Tab Analisis per Label")
+    st.caption("Setiap label memiliki summary, wordcloud, keyphrases/topik utama, dan contoh komentar representatif.")
+    label_tabs = st.tabs(labels)
+    for tab, label in zip(label_tabs, labels):
+        with tab:
+            label_texts_clean = result_df.loc[result_df[f"pred_{label}"] == 1, "text_clean"].tolist()
+            label_texts_original = result_df.loc[result_df[f"pred_{label}"] == 1, text_col].fillna("").astype(str).tolist()
+            label_count = len(label_texts_clean)
+            label_kps = [
+                (r["keyphrase"], r["score"])
+                for _, r in keyphrase_df[keyphrase_df["label"] == label].head(top_n_keyphrases).iterrows()
+            ]
+            sub_summary, sub_wc, sub_keyphrases, sub_examples = st.tabs(["Summary", "WordCloud", "Keyphrases/Topik Utama", "Contoh Komentar"])
 
-    st.subheader("6. Hasil Klasifikasi")
+            with sub_summary:
+                st.markdown(f"#### Summary {label}")
+                if label_count == 0:
+                    st.info(f"Tidak ada komentar yang diklasifikasikan sebagai {label}.")
+                else:
+                    transformer_text = None
+                    if use_transformer_summary:
+                        with st.spinner(f"Membuat abstractive summary Transformer untuk {label}..."):
+                            transformer_text = transformer_summary(label_texts_original, summarizer_model)
+                    if transformer_text:
+                        st.markdown("**Abstractive summary berbasis Transformer:**")
+                        st.write(transformer_text)
+                        st.markdown("**Interpretasi pedagogis:**")
+                        st.write(fallback_abstractive_summary(label, label_count, len(result_df), label_kps, combo_summary))
+                    else:
+                        st.markdown("**Abstractive topic-guided summary:**")
+                        st.write(fallback_abstractive_summary(label, label_count, len(result_df), label_kps, combo_summary))
+                    st.info(LABEL_TEACHER_ACTION.get(label, ""))
+
+            with sub_wc:
+                st.markdown(f"#### WordCloud {label}")
+                image = generate_wordcloud(label_texts_clean)
+                if image is None:
+                    st.info(f"Tidak ada teks yang diklasifikasikan sebagai {label}.")
+                else:
+                    st.image(image, use_container_width=True)
+
+            with sub_keyphrases:
+                st.markdown(f"#### Keyphrases dan Topik Utama {label}")
+                label_kp_df = keyphrase_df[keyphrase_df["label"] == label].copy()
+                if label_kp_df.empty:
+                    st.info(f"Belum ada keyphrase untuk label {label}.")
+                else:
+                    st.write("Keyphrase diekstrak dengan TF-IDF unigram, bigram, dan trigram. Frasa multi-kata diprioritaskan agar informasi tidak hanya berupa satu kata.")
+                    st.dataframe(label_kp_df, use_container_width=True)
+                    chart_df = label_kp_df.head(12).set_index("keyphrase")["score"]
+                    st.bar_chart(chart_df)
+
+            with sub_examples:
+                st.markdown(f"#### Contoh Komentar Representatif {label}")
+                examples = representative_comments(result_df, label, text_col, top_n=8)
+                if examples.empty:
+                    st.info(f"Tidak ada contoh komentar untuk label {label}.")
+                else:
+                    st.dataframe(examples, use_container_width=True)
+
+    st.subheader("6. Keyphrase Extraction & Topic Modelling")
+    global_tabs = st.tabs(["Keyphrase per Label", "NMF Global Topics", "Assignment Topik per Dokumen"])
+    with global_tabs[0]:
+        st.write("Keyphrase per label menggunakan TF-IDF unigram, bigram, dan trigram. Frasa multi-kata diprioritaskan agar hasil lebih bermakna untuk interpretasi pengajar.")
+        st.dataframe(keyphrase_df, use_container_width=True)
+        st.download_button(
+            label="⬇️ Download keyphrase per label CSV",
+            data=dataframe_to_csv_bytes(keyphrase_df),
+            file_name="peer_feedback_keyphrases_by_label.csv",
+            mime="text/csv",
+        )
+
+    with global_tabs[1]:
+        st.write("Topic modelling global menggunakan Non-negative Matrix Factorization (NMF) di atas representasi TF-IDF unigram, bigram, dan trigram.")
+        if topics_df.empty:
+            st.info("Topic modelling belum dapat dibuat karena jumlah teks/fitur tidak mencukupi.")
+        else:
+            st.dataframe(topics_df, use_container_width=True)
+            st.write("**Distribusi topik**")
+            st.dataframe(topic_distribution, use_container_width=True)
+            st.bar_chart(topic_distribution.set_index("topic_label")["count"])
+
+    with global_tabs[2]:
+        st.write("Setiap dokumen/komentar diberi topik dominan berdasarkan skor NMF tertinggi.")
+        if doc_topics.empty:
+            st.info("Assignment topik belum tersedia.")
+        else:
+            show_cols = ["text", "predicted_labels", "topic_id", "topic_label", "topic_confidence"]
+            st.dataframe(doc_topics[show_cols], use_container_width=True)
+            st.download_button(
+                label="⬇️ Download assignment topik per dokumen CSV",
+                data=dataframe_to_csv_bytes(doc_topics),
+                file_name="peer_feedback_topic_assignment_by_document.csv",
+                mime="text/csv",
+            )
+
+    st.subheader("7. Hasil Klasifikasi")
     st.dataframe(result_df, use_container_width=True)
 
     st.download_button(
@@ -635,14 +742,12 @@ if st.button("🚀 Jalankan Klasifikasi", type="primary"):
         file_name="peer_feedback_classification_results.csv",
         mime="text/csv",
     )
-
     st.download_button(
         label="⬇️ Download ringkasan label CSV",
         data=dataframe_to_csv_bytes(label_summary),
         file_name="peer_feedback_label_summary.csv",
         mime="text/csv",
     )
-
     st.download_button(
         label="⬇️ Download kombinasi label CSV",
         data=dataframe_to_csv_bytes(combo_summary),
@@ -650,5 +755,5 @@ if st.button("🚀 Jalankan Klasifikasi", type="primary"):
         mime="text/csv",
     )
 
-    st.subheader("7. Metadata Model")
+    st.subheader("8. Metadata Model")
     st.json(metadata)

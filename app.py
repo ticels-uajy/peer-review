@@ -697,39 +697,171 @@ if st.button("🚀 Jalankan Klasifikasi", type="primary"):
                 else:
                     st.dataframe(examples, use_container_width=True)
 
-    st.subheader("6. Keyphrase Extraction & Topic Modelling")
-    global_tabs = st.tabs(["Keyphrase per Label", "NMF Global Topics", "Assignment Topik per Dokumen"])
-    with global_tabs[0]:
-        st.write("Keyphrase per label menggunakan TF-IDF unigram, bigram, dan trigram. Frasa multi-kata diprioritaskan agar hasil lebih bermakna untuk interpretasi pengajar.")
-        st.dataframe(keyphrase_df, use_container_width=True)
+    st.subheader("6. Keyphrase Extraction & Topic Modelling per Label")
+    st.caption(
+        "Analisis keyphrase dan topic modelling dikelompokkan per label agar pengajar dapat melihat tema utama "
+        "yang muncul pada Appreciation, Problem, Suggestion, dan Neutral secara terpisah. "
+        "Keyphrase menggunakan TF-IDF unigram, bigram, dan trigram; frasa multi-kata diprioritaskan."
+    )
+
+    # Container untuk menggabungkan semua hasil topic modelling per label agar bisa diunduh.
+    all_label_topics = []
+    all_label_topic_distributions = []
+    all_label_doc_topics = []
+
+    per_label_topic_tabs = st.tabs(labels)
+    for label_tab, label in zip(per_label_topic_tabs, labels):
+        with label_tab:
+            label_subset = result_df.loc[result_df[f"pred_{label}"] == 1].copy()
+            label_texts = label_subset["text_clean"].fillna("").astype(str).tolist()
+            label_predicted_labels = label_subset["predicted_labels"].fillna("").astype(str).tolist()
+            label_kp_df = keyphrase_df[keyphrase_df["label"] == label].copy()
+
+            st.markdown(f"#### {label}")
+            st.write(
+                f"Bagian ini menampilkan keyphrase dan topik utama dari **{len(label_subset)} komentar** "
+                f"yang diklasifikasikan sebagai **{label}**."
+            )
+
+            kp_tab, topic_tab, assign_tab = st.tabs([
+                "Keyphrase per Label",
+                "NMF Topics per Label",
+                "Assignment Topik Dokumen",
+            ])
+
+            with kp_tab:
+                st.markdown("##### Keyphrase utama")
+                if label_kp_df.empty:
+                    st.info(f"Belum ada keyphrase untuk label {label}.")
+                else:
+                    st.write(
+                        "Keyphrase diekstrak dari komentar pada label ini menggunakan TF-IDF unigram, bigram, "
+                        "dan trigram. Kolom `n_words` membantu membedakan kata tunggal dan frasa multi-kata."
+                    )
+                    st.dataframe(label_kp_df, use_container_width=True)
+                    st.bar_chart(label_kp_df.head(15).set_index("keyphrase")["score"])
+                    st.download_button(
+                        label=f"⬇️ Download keyphrase {label} CSV",
+                        data=dataframe_to_csv_bytes(label_kp_df),
+                        file_name=f"peer_feedback_keyphrases_{label.lower()}.csv",
+                        mime="text/csv",
+                    )
+
+            with topic_tab:
+                st.markdown("##### Topic modelling NMF khusus label")
+                st.write(
+                    "Topic modelling pada tab ini hanya menggunakan komentar yang termasuk label ini, "
+                    "sehingga topik yang muncul lebih spesifik dibanding topic modelling global."
+                )
+                label_n_topics = min(n_topics, max(1, len(label_subset)))
+                label_topics_df, label_topic_distribution, label_doc_topics = run_topic_modeling(
+                    label_texts,
+                    label_predicted_labels,
+                    n_topics=label_n_topics,
+                    top_terms=12,
+                )
+
+                if label_topics_df.empty:
+                    st.info(
+                        f"Topic modelling untuk label {label} belum dapat dibuat. "
+                        "Kemungkinan jumlah komentar atau variasi kata terlalu sedikit."
+                    )
+                else:
+                    label_topics_df = label_topics_df.copy()
+                    label_topic_distribution = label_topic_distribution.copy()
+                    label_doc_topics = label_doc_topics.copy()
+                    label_topics_df.insert(0, "label", label)
+                    label_topic_distribution.insert(0, "label", label)
+                    label_doc_topics.insert(0, "label", label)
+
+                    all_label_topics.append(label_topics_df)
+                    all_label_topic_distributions.append(label_topic_distribution)
+                    all_label_doc_topics.append(label_doc_topics)
+
+                    st.write("**Topik utama pada label ini**")
+                    st.dataframe(label_topics_df, use_container_width=True)
+                    st.write("**Distribusi topik pada label ini**")
+                    st.dataframe(label_topic_distribution, use_container_width=True)
+                    st.bar_chart(label_topic_distribution.set_index("topic_label")["count"])
+
+            with assign_tab:
+                st.markdown("##### Assignment topik untuk dokumen pada label ini")
+                # Jika topic modelling belum berhasil dijalankan pada tab topic, jalankan ulang ringan di sini.
+                if 'label_doc_topics' not in locals() or label_doc_topics.empty:
+                    tmp_topics, tmp_dist, tmp_docs = run_topic_modeling(
+                        label_texts,
+                        label_predicted_labels,
+                        n_topics=min(n_topics, max(1, len(label_subset))),
+                        top_terms=12,
+                    )
+                    label_doc_topics_to_show = tmp_docs
+                else:
+                    label_doc_topics_to_show = label_doc_topics
+
+                if label_doc_topics_to_show.empty:
+                    st.info(f"Assignment topik untuk label {label} belum tersedia.")
+                else:
+                    show_cols = ["text", "predicted_labels", "topic_id", "topic_label", "topic_confidence"]
+                    existing_cols = [c for c in show_cols if c in label_doc_topics_to_show.columns]
+                    st.dataframe(label_doc_topics_to_show[existing_cols], use_container_width=True)
+                    st.download_button(
+                        label=f"⬇️ Download assignment topik {label} CSV",
+                        data=dataframe_to_csv_bytes(label_doc_topics_to_show),
+                        file_name=f"peer_feedback_topic_assignment_{label.lower()}.csv",
+                        mime="text/csv",
+                    )
+
+    st.markdown("#### Download gabungan hasil Keyphrase & Topic Modelling")
+    col_dl1, col_dl2, col_dl3 = st.columns(3)
+    with col_dl1:
         st.download_button(
-            label="⬇️ Download keyphrase per label CSV",
+            label="⬇️ Semua keyphrase per label",
             data=dataframe_to_csv_bytes(keyphrase_df),
             file_name="peer_feedback_keyphrases_by_label.csv",
             mime="text/csv",
         )
-
-    with global_tabs[1]:
-        st.write("Topic modelling global menggunakan Non-negative Matrix Factorization (NMF) di atas representasi TF-IDF unigram, bigram, dan trigram.")
-        if topics_df.empty:
-            st.info("Topic modelling belum dapat dibuat karena jumlah teks/fitur tidak mencukupi.")
+    with col_dl2:
+        if all_label_topics:
+            combined_topics = pd.concat(all_label_topics, ignore_index=True)
+            st.download_button(
+                label="⬇️ Semua topik per label",
+                data=dataframe_to_csv_bytes(combined_topics),
+                file_name="peer_feedback_nmf_topics_by_label.csv",
+                mime="text/csv",
+            )
         else:
+            st.button("⬇️ Semua topik per label", disabled=True)
+    with col_dl3:
+        if all_label_doc_topics:
+            combined_doc_topics = pd.concat(all_label_doc_topics, ignore_index=True)
+            st.download_button(
+                label="⬇️ Semua assignment topik",
+                data=dataframe_to_csv_bytes(combined_doc_topics),
+                file_name="peer_feedback_topic_assignment_by_label.csv",
+                mime="text/csv",
+            )
+        else:
+            st.button("⬇️ Semua assignment topik", disabled=True)
+
+    with st.expander("Lihat juga topic modelling global seluruh komentar", expanded=False):
+        st.write(
+            "Bagian ini bersifat tambahan. Berbeda dari analisis per label, topic modelling global menggunakan semua komentar sekaligus."
+        )
+        if topics_df.empty:
+            st.info("Topic modelling global belum dapat dibuat karena jumlah teks/fitur tidak mencukupi.")
+        else:
+            st.write("**NMF Global Topics**")
             st.dataframe(topics_df, use_container_width=True)
-            st.write("**Distribusi topik**")
+            st.write("**Distribusi topik global**")
             st.dataframe(topic_distribution, use_container_width=True)
             st.bar_chart(topic_distribution.set_index("topic_label")["count"])
-
-    with global_tabs[2]:
-        st.write("Setiap dokumen/komentar diberi topik dominan berdasarkan skor NMF tertinggi.")
-        if doc_topics.empty:
-            st.info("Assignment topik belum tersedia.")
-        else:
+            st.write("**Assignment topik global per dokumen**")
             show_cols = ["text", "predicted_labels", "topic_id", "topic_label", "topic_confidence"]
             st.dataframe(doc_topics[show_cols], use_container_width=True)
             st.download_button(
-                label="⬇️ Download assignment topik per dokumen CSV",
+                label="⬇️ Download assignment topik global CSV",
                 data=dataframe_to_csv_bytes(doc_topics),
-                file_name="peer_feedback_topic_assignment_by_document.csv",
+                file_name="peer_feedback_topic_assignment_global.csv",
                 mime="text/csv",
             )
 

@@ -1,29 +1,41 @@
-# Peer Feedback Multi-Label Classifier
+# Peer Feedback Insight Generator
 
-Aplikasi Streamlit untuk mengklasifikasikan peer feedback/peer comments ke dalam label multi-label: Appreciation, Problem, Suggestion, dan Neutral. Aplikasi ini mendukung model terbaik berbasis Machine Learning dan Deep Learning, serta menghasilkan learning insights untuk pengajar.
+Aplikasi Streamlit untuk klasifikasi multi-label peer feedback dan pembuatan learning insights bagi pengajar.
 
-## Fitur Utama
+## Fitur
 
-1. Upload data peer feedback dalam format CSV.
-2. Pilih model terbaik: Machine Learning atau Deep Learning.
-3. Klasifikasi multi-label untuk setiap komentar.
+1. Upload data teks peer feedback dalam format CSV.
+2. Pilih model terbaik yang digunakan untuk klasifikasi: Machine Learning atau Deep Learning.
+3. Klasifikasi multi-label untuk setiap komentar: `Appreciation`, `Problem`, `Suggestion`, dan `Neutral`.
 4. Ringkasan learning insights yang lebih readable untuk pengajar.
-5. Tab analisis untuk setiap label yang berisi:
+5. Tab analisis untuk setiap label, berisi:
    - abstractive summary,
    - wordcloud,
    - keyphrases/topik utama,
    - contoh komentar representatif.
-6. Bagian **Keyphrase Extraction & Topic Modelling per Label**:
+6. Bagian **Keyphrase Extraction & Topic Modelling per Label**, berisi:
    - keyphrase per label menggunakan TF-IDF unigram, bigram, dan trigram,
    - topic modelling NMF khusus untuk setiap label,
    - assignment topik untuk setiap dokumen pada masing-masing label,
    - download hasil keyphrase, topik, dan assignment topik.
 7. Topic modelling global tersedia sebagai informasi tambahan melalui expander.
-8. Download hasil klasifikasi, ringkasan label, dan kombinasi label.
+8. Download semua hasil analisis dalam satu ZIP, termasuk:
+   - hasil klasifikasi multi-label,
+   - ringkasan label,
+   - kombinasi label,
+   - co-occurrence antarlabel,
+   - learning insights Markdown,
+   - summary per label,
+   - wordcloud PNG per label,
+   - keyphrases per label,
+   - NMF topics per label,
+   - assignment topik per label,
+   - topic modelling global,
+   - metadata model.
 
 ## Struktur Artefak Model
 
-Letakkan artefak model pada folder, misalnya:
+Letakkan artefak model dalam folder seperti berikut:
 
 ```text
 artifacts/latest_run/
@@ -41,10 +53,14 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Jika menggunakan model DL dengan format Keras 3 dan environment lama bermasalah, jalankan:
+Jika model DL `.keras` disimpan dengan Keras 3, gunakan environment yang bersih:
 
 ```bash
 pip uninstall -y keras tensorflow tensorflow-cpu tf-keras
 pip install -r requirements.txt
 streamlit run app.py
 ```
+
+## Catatan Summary
+
+Aplikasi menyediakan summary per label. Jika opsi Transformer-based abstractive summarization diaktifkan dan model summarization tersedia, aplikasi akan mencoba menggunakan model tersebut. Jika gagal, aplikasi otomatis menggunakan fallback topic-guided abstractive synthesis berbasis jumlah komentar, keyphrase, kombinasi label, dan interpretasi pedagogis.

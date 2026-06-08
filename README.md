@@ -1,25 +1,41 @@
-# Peer Feedback Multi-Label Classifier Streamlit App
+# Peer Feedback Multi-Label Classifier and Learning Insight Generator
 
-Aplikasi ini digunakan untuk mengklasifikasikan data teks peer feedback/peer comments ke dalam empat label multi-label:
+Aplikasi Streamlit ini mengklasifikasikan peer feedback / peer comments ke dalam label multi-label:
 
 - Appreciation
 - Problem
 - Suggestion
 - Neutral
 
-Aplikasi mendukung dua model terbaik:
+Aplikasi mendukung dua artefak model terbaik:
 
-1. Model Machine Learning: `best_ml_model.joblib`
-2. Model Deep Learning: `best_dl_model.keras` + `best_dl_tokenizer.joblib`
+- model machine learning: `best_ml_model.joblib`
+- model deep learning: `best_dl_model.keras` + `best_dl_tokenizer.joblib`
 
-## Struktur Folder yang Disarankan
+## Fitur utama
 
-Letakkan artefak model dari pipeline training di folder berikut:
+1. Upload CSV berisi teks peer feedback.
+2. Pilih model terbaik yang digunakan untuk prediksi: Machine Learning atau Deep Learning.
+3. Klasifikasi multi-label setiap komentar.
+4. Ringkasan learning insights global untuk pengajar.
+5. Tab analisis untuk setiap label yang berisi:
+   - abstractive summary,
+   - wordcloud,
+   - keyphrases/topik utama,
+   - contoh komentar representatif.
+6. Tab khusus **Keyphrase Extraction & Topic Modelling**:
+   - keyphrase per label menggunakan TF-IDF unigram/bigram,
+   - topic modelling global menggunakan NMF,
+   - assignment topik untuk setiap dokumen.
+7. Download hasil klasifikasi, ringkasan label, kombinasi label, keyphrase, dan topic modelling.
+
+## Struktur artefak yang disarankan
 
 ```text
 peer_feedback_streamlit_app/
 ├── app.py
 ├── requirements.txt
+├── sample_peer_feedback.csv
 └── artifacts/
     └── latest_run/
         ├── best_ml_model.joblib
@@ -29,69 +45,43 @@ peer_feedback_streamlit_app/
         └── best_dl_model_metadata.json
 ```
 
-Jika nama folder run Anda berbeda, ubah input **Folder artefak model** di sidebar Streamlit.
-
 ## Instalasi
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Jika hanya menggunakan model ML, dependency TensorFlow dapat dihapus dari `requirements.txt`.
+Jika memakai model deep learning `.keras` yang disimpan dengan Keras 3, gunakan environment bersih:
 
-## Menjalankan Aplikasi
+```bash
+pip uninstall -y keras tensorflow tensorflow-cpu tf-keras
+pip install -r requirements.txt
+```
+
+## Menjalankan aplikasi
 
 ```bash
 streamlit run app.py
 ```
 
-## Format CSV Input
+## Abstractive summarization
 
-CSV minimal memiliki satu kolom teks, misalnya:
+Aplikasi menyediakan dua mode summary:
+
+1. **Transformer-based abstractive summarization** jika opsi di sidebar diaktifkan dan model summarization tersedia.
+   Default model: `cahya/t5-base-indonesian-summarization-cased`.
+2. **Topic-guided abstractive synthesis** sebagai fallback otomatis jika model Transformer tidak tersedia atau gagal dimuat.
+
+Fallback tetap bersifat abstraktif dalam arti summary disusun sebagai narasi baru berbasis distribusi label, keyphrase, dan interpretasi pedagogis, bukan sekadar mengambil kalimat asli dari komentar.
+
+## Format CSV
+
+CSV harus memiliki minimal satu kolom teks. Nama kolom bebas, misalnya:
 
 ```csv
 text
-"Bagian ini sudah bagus, tetapi perlu ditambahkan referensi."
-"Tulisan sudah rapi dan mudah dipahami."
+"Penjelasannya sudah baik, tetapi bagian metode perlu dibuat lebih jelas."
+"Sebaiknya tambahkan contoh agar pembaca lebih mudah memahami."
 ```
 
-Di aplikasi, pilih nama kolom yang berisi teks peer feedback.
-
-## Fitur
-
-1. Upload data teks peer feedback dalam format CSV.
-2. Memilih model terbaik yang digunakan untuk klasifikasi: ML atau DL.
-3. Mengklasifikasikan teks peer feedback secara multi-label.
-4. Menampilkan insight jumlah feedback per label dan kombinasi label.
-5. Menampilkan wordcloud untuk setiap label.
-6. Menampilkan summary learning insight otomatis.
-7. Mengunduh hasil klasifikasi dan ringkasan dalam format CSV.
-
-## Output Prediksi
-
-Aplikasi akan menambahkan kolom berikut:
-
-```text
-pred_Appreciation
-pred_Problem
-pred_Suggestion
-pred_Neutral
-score_Appreciation
-score_Problem
-score_Suggestion
-score_Neutral
-predicted_labels
-n_predicted_labels
-```
-
-## Catatan Metodologis
-
-Aplikasi ini hanya digunakan untuk inference/deployment. Proses pemilihan model terbaik tetap dilakukan di pipeline training dengan protokol:
-
-```text
-Dataset gabungan
-→ iterative multilabel train-test split 80:20
-→ training set untuk cross-validation dan model selection
-→ threshold tuning pada validation fold/split
-→ test set hanya untuk final evaluation
-```
+Setelah upload, pilih kolom teks pada UI aplikasi.

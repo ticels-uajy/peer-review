@@ -9,6 +9,14 @@ wordcloud>=1.9,<2.0
 Pillow>=10.0,<12.0
 
 # Required only if you use the deep learning model option.
-tensorflow>=2.13,<2.17
-keras>=2.13,<3.0
+# Use this Keras 3-compatible stack for models saved in .keras format.
+tensorflow>=2.16,<2.18
+keras>=3.0,<4.0
 h5py>=3.8,<4.0
+
+# Optional but recommended for Transformer-based abstractive summarization.
+# If unavailable, the app falls back to topic-guided abstractive synthesis.
+transformers>=4.40,<5.0
+sentencepiece>=0.1.99,<0.3
+# torch is required by most Hugging Face summarization pipelines.
+torch>=2.1,<3.0

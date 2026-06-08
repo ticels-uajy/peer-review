@@ -1,6 +1,6 @@
 {
   "family": "DL",
-  "best_model_name": "GRU",
+  "best_model_name": "BiGRU",
   "candidate_architectures": [
     "RNN",
     "LSTM",
@@ -10,22 +10,22 @@
   ],
   "selection_metric": "cross_validation val_micro_f1_mean",
   "selection_source": "training_set_cross_validation",
-  "validation_micro_f1": 0.8324873096446701,
+  "validation_micro_f1": 0.8031914893617021,
   "test_metrics": {
-    "subset_accuracy_exact_match": 0.5379310344827586,
-    "hamming_loss": 0.1724137931034483,
-    "micro_f1": 0.7959183673469388,
-    "macro_f1": 0.6987536869628992,
-    "weighted_f1": 0.7955342339738785,
-    "samples_f1": 0.8089983579638752,
-    "jaccard_micro": 0.6610169491525424,
-    "jaccard_samples": 0.7448275862068966
+    "subset_accuracy_exact_match": 0.4732824427480916,
+    "hamming_loss": 0.18129770992366412,
+    "micro_f1": 0.8,
+    "macro_f1": 0.7231469979296067,
+    "weighted_f1": 0.8252228091561696,
+    "samples_f1": 0.8174845510723373,
+    "jaccard_micro": 0.6666666666666666,
+    "jaccard_samples": 0.7353689567430025
   },
   "thresholds": {
-    "Appreciation": 0.65,
-    "Problem": 0.3,
+    "Appreciation": 0.5,
+    "Problem": 0.35,
     "Suggestion": 0.4,
-    "Neutral": 0.25
+    "Neutral": 0.2
   },
   "model_file": "best_dl_model.keras",
   "tokenizer_file": "best_dl_tokenizer.joblib",
@@ -33,6 +33,6 @@
   "dl_max_len": 200,
   "dl_max_words": 10000,
   "embedding_path": null,
-  "cv_summary_path": "/home/jupyter-sigitpurnomo/research/peer-review/baru/artifacts/multilabel_run_20260605_084525/dl/cross_validation/dl_cv_summary_metrics.csv",
+  "cv_summary_path": "/home/jupyter-sigitpurnomo/research/peer-review/baru/artifacts/multilabel_run_20260608_144317/dl/cross_validation/dl_cv_summary_metrics.csv",
   "test_usage": "Test set was evaluated once only for the selected best DL model."
 }

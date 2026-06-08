@@ -809,24 +809,7 @@ if st.button("🚀 Jalankan Klasifikasi dan Analisis", type="primary"):
         metric_cols[idx].metric(label, f"{count}", f"{pct}%")
     st.markdown(insight_markdown)
 
-    st.subheader("3. Klasifikasi Multi-label untuk Setiap Komentar")
-    st.dataframe(result_df, use_container_width=True)
-
-    st.subheader("4. Ringkasan Label dan Kombinasi Label")
-    left, right = st.columns([1, 1])
-    with left:
-        st.write("**Jumlah komentar per label**")
-        st.dataframe(label_summary, use_container_width=True)
-        st.bar_chart(label_summary.set_index("label")["count"])
-    with right:
-        st.write("**Kombinasi label**")
-        st.dataframe(combo_summary, use_container_width=True)
-        st.bar_chart(combo_summary.set_index("label_combination")["count"])
-
-    st.write("**Co-occurrence antar label**")
-    st.dataframe(pair_summary, use_container_width=True)
-
-    st.subheader("5. Analisis per Label")
+    st.subheader("3. Analisis per Label")
     label_tabs = st.tabs(labels)
     for tab, label in zip(label_tabs, labels):
         with tab:
@@ -875,7 +858,7 @@ if st.button("🚀 Jalankan Klasifikasi dan Analisis", type="primary"):
                     key=f"download_rep_{label}",
                 )
 
-    st.subheader("6. Keyphrase Extraction & Topic Modelling per Label")
+    st.subheader("4. Keyphrase Extraction & Topic Modelling per Label")
     st.caption("Bagian ini dikelompokkan per label. Setiap label memiliki keyphrase TF-IDF n-gram, NMF topics khusus label tersebut, dan assignment topik untuk setiap dokumen pada label tersebut.")
     topic_label_tabs = st.tabs(labels)
     for tab, label in zip(topic_label_tabs, labels):
@@ -916,7 +899,7 @@ if st.button("🚀 Jalankan Klasifikasi dan Analisis", type="primary"):
     with c3:
         st.download_button("⬇️ Download semua assignment topik", dataframe_to_csv_bytes(all_assignments_df), "all_label_topic_assignments.csv", "text/csv")
 
-    st.subheader("7. Topic Modelling Global")
+    st.subheader("5. Topic Modelling Global")
     with st.expander("Lihat topic modelling global sebagai informasi tambahan"):
         st.write("Topic modelling global dihitung dari seluruh komentar yang diupload, tanpa memisahkan label.")
         if global_topics_df.empty:
@@ -931,6 +914,23 @@ if st.button("🚀 Jalankan Klasifikasi dan Analisis", type="primary"):
                 st.download_button("⬇️ Download global topics", dataframe_to_csv_bytes(global_topics_df.drop(columns=["top_terms_list"], errors="ignore")), "global_nmf_topics.csv", "text/csv")
             with gc2:
                 st.download_button("⬇️ Download global assignments", dataframe_to_csv_bytes(global_assignments_df), "global_topic_assignments.csv", "text/csv")
+
+    st.subheader("6. Klasifikasi Multi-label untuk Setiap Komentar")
+    st.dataframe(result_df, use_container_width=True)
+
+    st.subheader("7. Ringkasan Label dan Kombinasi Label")
+    left, right = st.columns([1, 1])
+    with left:
+        st.write("**Jumlah komentar per label**")
+        st.dataframe(label_summary, use_container_width=True)
+        st.bar_chart(label_summary.set_index("label")["count"])
+    with right:
+        st.write("**Kombinasi label**")
+        st.dataframe(combo_summary, use_container_width=True)
+        st.bar_chart(combo_summary.set_index("label_combination")["count"])
+
+    st.write("**Co-occurrence antar label**")
+    st.dataframe(pair_summary, use_container_width=True)
 
     st.subheader("8. Download Semua Hasil Analisis")
     st.write("Unduh seluruh hasil klasifikasi dan analisis dalam satu file ZIP. ZIP berisi hasil klasifikasi, learning insights, summary per label, wordcloud, keyphrases, NMF topics per label, assignment topik per label, topic modelling global, dan metadata model.")

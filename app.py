@@ -318,7 +318,7 @@ def generate_wordcloud_image(texts: List[str]) -> Optional[Image.Image]:
         height=500,
         background_color="white",
         stopwords=STOPWORDS_ID,
-        collocations=False,
+        collocations=True,
         collocation_threshold = 3,
         max_words=120,
     ).generate(text)

@@ -42,6 +42,6 @@
   },
   "model_file": "best_ml_model.joblib",
   "reports_dir": "best_ml_model_reports",
-  "cv_summary_path": "/home/jupyter-sigitpurnomo/research/peer-review/baru/artifacts/multilabel_run_20260608_144317/cross_validation/ml/ml_cv_summary_metrics.csv",
+  "cv_summary_path": "/home/jupyter-sigitpurnomo/research/peer-review/baru/artifacts/multilabel_run_20260608_160318/cross_validation/ml/ml_cv_summary_metrics.csv",
   "test_usage": "Test set was evaluated once only for the selected best ML model."
 }

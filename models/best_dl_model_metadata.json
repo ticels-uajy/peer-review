@@ -33,6 +33,6 @@
   "dl_max_len": 200,
   "dl_max_words": 10000,
   "embedding_path": null,
-  "cv_summary_path": "/home/jupyter-sigitpurnomo/research/peer-review/baru/artifacts/multilabel_run_20260608_144317/dl/cross_validation/dl_cv_summary_metrics.csv",
+  "cv_summary_path": "/home/jupyter-sigitpurnomo/research/peer-review/baru/artifacts/multilabel_run_20260608_160318/dl/cross_validation/dl_cv_summary_metrics.csv",
   "test_usage": "Test set was evaluated once only for the selected best DL model."
 }

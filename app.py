@@ -519,8 +519,6 @@ def generate_readable_learning_insights(
     top_label = label_summary.iloc[0]
     top_combo = combo_summary.iloc[0]
     lines = [
-        "## Ringkasan Learning Insights",
-        "",
         "### Ringkasan Eksekutif",
         f"Sebanyak **{n_rows} peer feedback** berhasil diklasifikasikan dengan pendekatan multi-label. Karena satu komentar dapat memiliki lebih dari satu label, total persentase antarlabel dapat melebihi 100%.",
         f"Kategori paling dominan adalah **{top_label['label']}** dengan **{int(top_label['count'])} komentar ({top_label['percentage']}%)**.",

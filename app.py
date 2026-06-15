@@ -344,7 +344,7 @@ def extract_keyphrases(texts: List[str], top_n: int = 15, prefer_multiword: bool
 
     vectorizer = TfidfVectorizer(
         stop_words=list(STOPWORDS_ID),
-        ngram_range=(2, 3),
+        ngram_range=(2, 4),
         min_df=1,
         max_features=5000,
         token_pattern=r"(?u)\b\w[\w\-]+\b",
@@ -390,7 +390,7 @@ def run_nmf_topic_modeling(texts: List[str], n_topics: int = 3, top_n_terms: int
     valid_texts = [t for _, t in indexed_texts]
     vectorizer = TfidfVectorizer(
         stop_words=list(STOPWORDS_ID),
-        ngram_range=(2, 3),
+        ngram_range=(2, 4),
         min_df=1,
         max_features=3000,
         token_pattern=r"(?u)\b\w[\w\-]+\b",
